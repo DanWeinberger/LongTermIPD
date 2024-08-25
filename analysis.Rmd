@@ -318,7 +318,9 @@ pred.ds%>%
   geom_point(aes(x=yearN, y=N_IPD))
 
 ```
-## Model for all PCV7 serotypes
+
+
+## Model for all PCV7 serotypes--with globa effects
 
 ```{r}
 mod.ds.pcv7 <- s1 %>%
@@ -346,31 +348,40 @@ for(i in 1:N_years){
   N_IPD[i,j] ~ dnegbin(prob[i,j],r[j])
   prob[i,j]<- r[j]/(r[j]+lambda[i,j])  ## likelihood 
 
-  log(lambda[i,j]) <-  beta1[i,j]
+  log(lambda[i,j]) <- epsilon1[i,j] #serotype-specific intercept + AR(1) effect centered around global effects
 
   }
 }
 
+# global AR(1) effect
+ beta1[1] ~dnorm( alpha1,(1 - rho_beta^2) * tau.beta1 )
+    for(i in 2:N_years){
+      beta1[i] ~ dnorm(alpha1 + rho_beta*beta1[i-1], tau.beta1 )
+    }
+
+#serotype-specifc AR(1)
   for(j in 1:N_sts){
-    beta1[1,j] ~ dnorm(mu[j], (1 - rho1^2) * tau.beta1) # Prior for the first time point
+    epsilon1[1,j] ~ dnorm(delta1[j] + beta1[], (1 - rho_eps^2) * tau.eps) 
   for(i in 2:N_years){
-    beta1[i,j] ~ dnorm(mu[j]+ rho1 * beta1[i-1,j], tau.beta1)
+    epsilon1[i,j] ~ dnorm( delta1[j] + beta1[i] + rho_eps * epsilon1[i-1,j], tau.eps)
   }
   }
   
-    rho1 ~ dunif(-1, 1)       # Uniform prior for rho; rho1 shared for all serotypes
-    tau.beta1 ~ dgamma(3, 2)  # Tight prior for tau, shared for all serotypes
+ ## priors ##
+    alpha1 ~ dnorm(0,1e-4)
+    tau_global ~dgamma(0.01,0.01)
+
+    rho_beta ~ dunif(-1, 1)       # Uniform prior for rho_beta--global AR(1)
+    rho_eps ~ dunif(-1, 1)  #prior for rho_eps same for all STs
+    
+    tau.beta1 ~ dgamma(3, 2)  # Tight prior for tau, 
+    tau.eps ~ dgamma(3, 2)  # Tight prior for tau, shared for all serotypes
 
     for(j in 1:N_sts){
-      mu[j] ~ dnorm(mu_global, tau_global)  # serotype meanscentered around global mean
-      r[j] ~ dunif(0,250)
-
-    }
+       delta1[j] ~ dnorm(0, tau_global)  # serotype means centered around 0
+       r[j] ~ dunif(0,250) #serotype dispersion parameter
+      }
     
-    mu_global ~ dnorm(0,1e-4)
-    tau_global ~dgamma(0.01,0.01)
-    
-
 }
 "
 ```
@@ -387,13 +398,13 @@ model_spec<-textConnection(model_string_pcv7)
 model_jags_pcv7<-jags.model(model_spec,
                        inits=list(inits1,inits2, inits3),
                        data=list('N_IPD'= mat.pcv7  ,
-                                 'N_years'=max(mod.ds$yearN),
+                                 'N_years'=max(mod.ds.pcv7$yearN),
                                  'N_sts'=ncol(mat.pcv7)
                        ),
                        n.adapt=10000,
                        n.chains=3, quiet=T)
 
-params<-c('rho1', 'mu','beta1','tau.beta1','lambda')
+params<-c('alpha1', 'epsilon1','delta1','beta1','tau.beta1','lambda')
 
 posterior_samples_pcv7 <-coda.samples(model_jags_pcv7, 
                                 params, 
@@ -446,7 +457,3 @@ preds%>%
   geom_point(aes(x=yearN, y=N_IPD)) +
   facet_wrap(~st)
 ```
-
-
-
-
