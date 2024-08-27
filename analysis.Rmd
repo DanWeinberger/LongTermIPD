@@ -361,7 +361,7 @@ for(i in 1:N_years){
 
 #serotype-specifc AR(1)
   for(j in 1:N_sts){
-    epsilon1[1,j] ~ dnorm(delta1[j] + beta1[], (1 - rho_eps^2) * tau.eps) 
+    epsilon1[1,j] ~ dnorm(delta1[j] + beta1[j], (1 - rho_eps^2) * tau.eps) 
   for(i in 2:N_years){
     epsilon1[i,j] ~ dnorm( delta1[j] + beta1[i] + rho_eps * epsilon1[i-1,j], tau.eps)
   }
