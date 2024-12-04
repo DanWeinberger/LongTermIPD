@@ -1,0 +1,653 @@
+---
+title: "19F in Germany"
+author: "Paloma Cárcamo"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, sf, spdep, INLA, cowplot)
+```
+
+Missing zipcode: 5685/39315
+
+Shapefiles from GADM https://gadm.org/download_country.html
+
+Vaccination coverage estimates from Robert Kock Institut https://robert-koch-institut.github.io/Inanspruchnahme_von_Routineimpfungen_in_Deutschland-Ergebnisse_aus_der_KV-Impfsurveillance/
+
+```{r}
+ger_ipd_raw <- read_csv("data/DE_IPD_deidentified.csv")
+
+ger_ipd <- ger_ipd_raw |> 
+  mutate(date = as.Date(DateOfIsolation, format = "%d/%m/%Y")) |> 
+  filter(!is.na(PLZpatient) & date > as.Date("2009-01-01")) |> 
+  mutate(plz = str_pad(PLZpatient, side = "left", pad = "0", width = 3)) |> 
+  group_by(plz, Serotype) |> 
+  summarise(ipd_st = n()) |> 
+  group_by(plz) |> 
+  mutate(ipd = sum(ipd_st)) |> 
+  ungroup() |> 
+  filter(Serotype == "19F") |> 
+  mutate(ratio_19F = ipd_st/ipd)
+
+ger_shp <- read_sf("data/gadm41_DEU_2.shp")
+
+ger_shp_plz <- read_sf("data/plz-2stellig.shp") |> 
+  st_transform(st_crs(ger_shp)) |> 
+  group_by(plz) |> 
+  summarise(geometry = st_union(geometry))
+
+ger_cov <- readxl::read_xlsx("data/kvis_vax.xlsx")
+
+ger_key_raw <- read_csv("data/zuordnung_plz_ort.csv")
+
+ger_key <- ger_key_raw |> 
+  mutate(ags2 = substr(ags, 1, 5),
+         plz2 = substr(plz, 1, 2)) |> 
+  distinct(ags2, plz2)
+```
+
+```{r}
+ger_covsf <- ger_shp |> 
+  right_join(ger_cov, by = c("CC_2" = "county_ags")) |> 
+  filter(vaccine == "Pneumokokken" & age_group == "24 Monate")
+```
+
+```{r, fig.width = 14, fig.height = 10}
+ger_covsf |> 
+  ggplot() +
+  geom_sf(aes(fill = vacc_rate), color = NA) +
+  scale_fill_viridis_c() +
+  facet_wrap(~year_birth) +
+  theme_void() +
+  labs(fill = "Vaccine coverage", title = "Pneumococcal vaccine coverage by AGS and year of birth")
+```
+
+```{r, fig.height = 10}
+ger_shp |> 
+  ggplot() +
+  geom_sf(data = ger_shp_plz, aes(fill = plz), color = NA, show.legend = FALSE) +
+  geom_sf(color = "black", fill = NA) +
+  theme_void()
+```
+
+
+### Aggregate vax rates to first two digits of plz
+
+(toma infinito tiempo en correr)
+
+```{r}
+# ger_shp_j <- ger_shp |>
+#   mutate(ags_area = st_area(geometry))
+# 
+# st_intersection_faster <- function(x, y) {
+#   y_indices <- st_intersects(x, y) |>
+#     unlist() |>
+#     unique() |>
+#     sort()
+# 
+#   y_subset <- y[y_indices, ]
+#   st_intersection(x, y_subset)
+# }
+# 
+# intersection_pre <- st_intersection_faster(ger_shp, ger_shp_plz)
+# 
+# intersection <- intersection_pre |>
+#   mutate(intersection_area = st_area(geometry),
+#          district_area = ger_shp_j$ags_area[match(intersection_pre$CC_2, ger_shp$CC_2)],
+#          overlap_percentage = (intersection_area / district_area) * 100)
+# 
+# plz_ags_key <- intersection |>
+#   st_drop_geometry() |>
+#   dplyr::select(CC_2, plz, overlap_percentage) |>
+#   arrange(CC_2, plz)
+# 
+# # write_rds(intersection_pre, "data/interim/intersection_pre.rds")
+# # write_rds(intersection, "data/interim/intersection.rds")
+# # write_rds(plz_ags_key, "data/interim/plz_ags_key.rds")
+
+plz_ags_key <- read_rds("data/interim/plz_ags_key.rds")
+```
+
+```{r}
+ger_cov_agg <- ger_cov |> 
+  filter(vaccine == "Pneumokokken" & age_group == "24 Monate") |> 
+  left_join(plz_ags_key, by = c("county_ags" = "CC_2")) |> 
+  mutate(new_pop = pop_weight*overlap_percentage,
+         vaxed = new_pop*(vacc_rate/100)) |> 
+  group_by(plz, year_birth) |> 
+  summarise(vax_pop = sum(vaxed, na.rm = TRUE),
+            all_pop = sum(new_pop, na.rm = TRUE)) |> 
+  mutate(vacc_rate = as.numeric(vax_pop/all_pop))
+
+ger_cov_sum <- ger_cov_agg |> 
+  group_by(plz) |> 
+  summarise(vacc_rate = mean(vacc_rate, na.rm = TRUE))
+```
+
+### First two digits of plz
+
+```{r}
+ger_ipd_plz2 <- ger_ipd_raw |> 
+  mutate(date = as.Date(DateOfIsolation, format = "%d/%m/%Y")) |> 
+  filter(!is.na(PLZpatient) & date > as.Date("2009-01-01")) |> 
+  mutate(plz = str_pad(PLZpatient, side = "left", pad = "0", width = 3),
+         plz_2 = substr(plz, 1, 2)) |> 
+  group_by(plz_2, Serotype) |> 
+  summarise(ipd_st = n()) |> 
+  group_by(plz_2) |> 
+  mutate(ipd = sum(ipd_st)) |> 
+  ungroup() |> 
+  filter(Serotype == "19F") |> 
+  mutate(ratio_19F = ipd_st/ipd)
+
+ger_ipd_plz2_v2 <- ger_ipd_raw |> 
+  mutate(date = as.Date(DateOfIsolation, format = "%d/%m/%Y"),
+         year = year(date)) |> 
+  filter(!is.na(PLZpatient) & date > as.Date("2009-01-01")) |> 
+  mutate(plz = str_pad(PLZpatient, side = "left", pad = "0", width = 3),
+         plz_2 = substr(plz, 1, 2)) |> 
+  group_by(plz_2, Serotype, year) |> 
+  summarise(ipd_st = n()) |> 
+  group_by(plz_2, year) |> 
+  mutate(ipd = sum(ipd_st)) |> 
+  ungroup() |> 
+  filter(Serotype == "19F") |> 
+  mutate(ratio_19F = ipd_st/ipd) |> 
+  group_by(plz_2) |> 
+  summarise(ratio_19F = mean(ratio_19F, na.rm = TRUE))
+
+ger_ipd_plz2_sf <- ger_shp_plz |> 
+  left_join(ger_ipd_plz2, by = c("plz" = "plz_2")) |> 
+  mutate(plz = factor(plz)) |> 
+  ungroup()
+
+ger_ipd_plz2_sf_v2 <- ger_shp_plz |> 
+  left_join(ger_ipd_plz2_v2, by = c("plz" = "plz_2")) |> 
+  mutate(plz = factor(plz)) |> 
+  ungroup()
+```
+
+```{r}
+ger_ipd_plz2_sf |> 
+  ggplot() +
+  geom_sf(aes(fill = ratio_19F), color = NA) +
+  scale_fill_viridis_c() +
+  theme_void()
+   
+ger_ipd_plz2_sf_v2 |> 
+  ggplot() +
+  geom_sf(aes(fill = ratio_19F), color = NA) +
+  scale_fill_viridis_c() +
+  theme_void()
+
+ger_shp_plz |> 
+  right_join(ger_cov_sum, by = "plz") |> 
+  ggplot() +
+  geom_sf(aes(fill = vacc_rate), color = NA) +
+  scale_fill_viridis_c() +
+  theme_void()
+```
+
+```{r}
+ger_shp_plz |> 
+  right_join(ger_cov_agg, by = "plz") |> 
+  ggplot() +
+  geom_sf(aes(fill = vacc_rate), color = NA) +
+  scale_fill_viridis_c() +
+  facet_wrap(~year_birth) +
+  theme_void()
+```
+### Model setup
+
+```{r}
+nb3 <- poly2nb(ger_shp_plz, queen = TRUE)
+nb2INLA("map_plz2.adj", nb3)
+g_plz2 <- inla.read.graph(filename = "map_plz2.adj")
+
+plz2_db <- ger_shp_plz |> 
+  st_drop_geometry() |> 
+  ungroup() |> 
+  mutate(idarea = row_number()) |> 
+  right_join(ger_cov_sum, by = "plz") |> 
+  right_join(ger_ipd_plz2, by = c("plz" = "plz_2")) |> 
+  mutate(vax_cat = cut(vacc_rate*100, breaks = 20))
+
+data_inla_plz2 <- list(
+  cases_19F = plz2_db$ipd_st,
+  total_cases = plz2_db$ipd,
+  N = plz2_db$ipd,
+  idarea = plz2_db$idarea,
+  vacc_rate = plz2_db$vacc_rate*100,
+  vax_cat = plz2_db$vax_cat
+)
+```
+
+#### No vaccine coverage
+
+```{r}
+f1 <- cases_19F ~ 1 + f(idarea, model = "bym2", graph = g_plz2)
+
+result1 <- inla(
+  f1, 
+  family = "binomial",
+  data = data_inla_plz2, 
+  Ntrials = data_inla_plz2$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+
+summary(result1)
+
+bym_st_plz21 <- ger_ipd_plz2_sf |> 
+  cbind(result1$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_plz21 <- ger_ipd_plz2_sf |> 
+  cbind(result1$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+plz2_structured1 <- bym_st_plz21 |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects") +
+  theme_void()
+
+plz2_unstructured1 <- bym_unst_plz21 |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects") +
+  theme_void()
+
+plot_grid(plz2_structured1, plz2_unstructured1, ncol = 2)
+```
+
+#### Linear vaccine coverage
+
+```{r}
+f2 <- cases_19F ~ 1 + vacc_rate + f(idarea, model = "bym2", graph = g_plz2)
+
+result2 <- inla(
+  f2, 
+  family = "binomial",
+  data = data_inla_plz2, 
+  Ntrials = data_inla_plz2$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+
+summary(result2)
+
+bym_st_plz22 <- ger_ipd_plz2_sf |> 
+  cbind(result2$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_plz22 <- ger_ipd_plz2_sf |> 
+  cbind(result2$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+plz2_structured2 <- bym_st_plz22 |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects") +
+  theme_void()
+
+plz2_unstructured2 <- bym_unst_plz22 |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects") +
+  theme_void()
+
+plot_grid(plz2_structured2, plz2_unstructured2, ncol = 2)
+```
+
+#### IID vaccine coverage (no extra constraint)
+
+```{r}
+f3 <- cases_19F ~ 1 + f(vax_cat, model = "iid") + f(idarea, model = "bym2", graph = g_plz2)
+
+result3 <- inla(
+  f3, 
+  family = "binomial",
+  data = data_inla_plz2, 
+  Ntrials = data_inla_plz2$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+
+summary(result3)
+
+bym_st_plz23 <- ger_ipd_plz2_sf |> 
+  cbind(result3$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_plz23 <- ger_ipd_plz2_sf |> 
+  cbind(result3$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+vaxcat3 <- result3$summary.random$vax_cat |> 
+  mutate(ID = factor(ID, levels = levels(plz2_db$vax_cat)))
+
+vaxcat3 |> 
+  ggplot(aes(x = ID, color = ID)) +
+  geom_errorbar(aes(ymin = `0.025quant`, ymax = `0.975quant`), show.legend = FALSE) +
+  geom_point(aes(y = mean), show.legend = FALSE) +
+  theme_bw()
+
+plz2_structured3 <- bym_st_plz23 |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects") +
+  theme_void()
+
+plz2_unstructured3 <- bym_unst_plz23 |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects") +
+  theme_void()
+
+plot_grid(plz2_structured3, plz2_unstructured3, ncol = 2)
+```
+
+#### RW1 vaccine coverage (no extra constraint)
+
+```{r}
+f4 <- cases_19F ~ 1 + f(vax_cat, model = "rw1") + f(idarea, model = "bym2", graph = g_plz2)
+
+result4 <- inla(
+  f4, 
+  family = "binomial",
+  data = data_inla_plz2, 
+  Ntrials = data_inla_plz2$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+
+summary(result4)
+
+bym_st_plz24 <- ger_ipd_plz2_sf |> 
+  cbind(result4$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_plz24 <- ger_ipd_plz2_sf |> 
+  cbind(result4$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+vaxcat4 <- result4$summary.random$vax_cat |> 
+  mutate(ID = factor(ID, levels = levels(plz2_db$vax_cat)))
+
+vaxcat4 |> 
+  ggplot(aes(x = ID, color = ID)) +
+  geom_errorbar(aes(ymin = `0.025quant`, ymax = `0.975quant`), show.legend = FALSE) +
+  geom_point(aes(y = mean), show.legend = FALSE) +
+  theme_bw()
+
+plz2_structured4 <- bym_st_plz24 |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects") +
+  theme_void()
+
+plz2_unstructured4 <- bym_unst_plz24 |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects") +
+  theme_void()
+
+plot_grid(plz2_structured4, plz2_unstructured4, ncol = 2)
+```
+
+#### RW2 vaccine coverage (no extra constraint)
+
+```{r}
+f5 <- cases_19F ~ 1 + f(vax_cat, model = "rw2") + f(idarea, model = "bym2", graph = g_plz2)
+
+result5 <- inla(
+  f5, 
+  family = "binomial",
+  data = data_inla_plz2, 
+  Ntrials = data_inla_plz2$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+
+summary(result5)
+
+bym_st_plz25 <- ger_ipd_plz2_sf |> 
+  cbind(result5$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_plz25 <- ger_ipd_plz2_sf |> 
+  cbind(result5$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+vaxcat5 <- result5$summary.random$vax_cat |> 
+  mutate(ID = factor(ID, levels = levels(plz2_db$vax_cat)))
+
+vaxcat5 |> 
+  ggplot(aes(x = ID, color = ID)) +
+  geom_errorbar(aes(ymin = `0.025quant`, ymax = `0.975quant`), show.legend = FALSE) +
+  geom_point(aes(y = mean), show.legend = FALSE) +
+  theme_bw()
+
+plz2_structured5 <- bym_st_plz25 |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects") +
+  theme_void()
+
+plz2_unstructured5 <- bym_unst_plz25 |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects") +
+  theme_void()
+
+plot_grid(plz2_structured5, plz2_unstructured5, ncol = 2)
+```
+#### IID vaccine coverage (forcing reference: lowest vax)
+
+```{r}
+extraconstr <- list(
+  A = matrix(0, nrow = 1, ncol = nlevels(plz2_db$vax_cat)),
+  e = 0
+)
+
+extraconstr$A[1, 1] <- 1
+
+f6 <- cases_19F ~ 1 + f(vax_cat, model = "iid", constr = FALSE, extraconstr = extraconstr) + f(idarea, model = "bym2", graph = g_plz2)
+
+result6 <- inla(
+  f6, 
+  family = "binomial",
+  data = data_inla_plz2, 
+  Ntrials = data_inla_plz2$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+
+summary(result6)
+
+bym_st_plz26 <- ger_ipd_plz2_sf |> 
+  cbind(result6$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_plz26 <- ger_ipd_plz2_sf |> 
+  cbind(result6$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+vaxcat6 <- result6$summary.random$vax_cat |> 
+  mutate(ID = factor(ID, levels = levels(plz2_db$vax_cat)))
+
+vaxcat6 |> 
+  ggplot(aes(x = ID, color = ID)) +
+  geom_errorbar(aes(ymin = `0.025quant`, ymax = `0.975quant`), show.legend = FALSE) +
+  geom_point(aes(y = mean), show.legend = FALSE) +
+  theme_bw()
+
+plz2_structured6 <- bym_st_plz26 |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects") +
+  theme_void()
+
+plz2_unstructured6 <- bym_unst_plz26 |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects") +
+  theme_void()
+
+plot_grid(plz2_structured6, plz2_unstructured6, ncol = 2)
+```
+
+#### RW1 vaccine coverage (forcing reference: lowest vax)
+
+```{r}
+f7 <- cases_19F ~ 1 + f(vax_cat, model = "rw1", constr = FALSE, extraconstr = extraconstr) + f(idarea, model = "bym2", graph = g_plz2)
+
+result7 <- inla(
+  f7, 
+  family = "binomial",
+  data = data_inla_plz2, 
+  Ntrials = data_inla_plz2$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+
+summary(result7)
+
+bym_st_plz27 <- ger_ipd_plz2_sf |> 
+  cbind(result7$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_plz27 <- ger_ipd_plz2_sf |> 
+  cbind(result7$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+vaxcat7 <- result7$summary.random$vax_cat |> 
+  mutate(ID = factor(ID, levels = levels(plz2_db$vax_cat)))
+
+vaxcat7 |> 
+  ggplot(aes(x = ID, color = ID)) +
+  geom_errorbar(aes(ymin = `0.025quant`, ymax = `0.975quant`), show.legend = FALSE) +
+  geom_point(aes(y = mean), show.legend = FALSE) +
+  theme_bw()
+
+plz2_structured7 <- bym_st_plz27 |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects") +
+  theme_void()
+
+plz2_unstructured7 <- bym_unst_plz27 |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects") +
+  theme_void()
+
+plot_grid(plz2_structured7, plz2_unstructured7, ncol = 2)
+```
+
+#### RW2 vaccine coverage (forcing reference: lowest vax)
+
+```{r, fig.width = 12}
+f8 <- cases_19F ~ 1 + f(vax_cat, model = "rw2", constr = FALSE, extraconstr = extraconstr) + f(idarea, model = "bym2", graph = g_plz2)
+
+result8 <- inla(
+  f8, 
+  family = "binomial",
+  data = data_inla_plz2, 
+  Ntrials = data_inla_plz2$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+
+summary(result8)
+
+bym_st_plz28 <- ger_ipd_plz2_sf |> 
+  cbind(result8$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_plz28 <- ger_ipd_plz2_sf |> 
+  cbind(result8$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+vaxcat8 <- result8$summary.random$vax_cat |> 
+  mutate(ID = factor(ID, levels = levels(plz2_db$vax_cat)))
+
+vaxcat8 |> 
+  ggplot(aes(x = ID, color = ID)) +
+  geom_errorbar(aes(ymin = `0.025quant`, ymax = `0.975quant`), show.legend = FALSE) +
+  geom_point(aes(y = mean), show.legend = FALSE) +
+  theme_bw()
+
+plz2_structured8 <- bym_st_plz28 |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects") +
+  theme_void()
+
+plz2_unstructured8 <- bym_unst_plz28 |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects") +
+  theme_void()
+
+plot_grid(plz2_structured8, plz2_unstructured8, ncol = 2)
+```

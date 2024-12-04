@@ -1,0 +1,521 @@
+---
+title: "19F in Germany"
+author: "Paloma Cárcamo"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, sf, spdep, INLA, cowplot)
+```
+
+### 3-digit zipcode
+
+Missing zipcode: 5685/39315
+
+Shapefiles from: https://www.suche-postleitzahl.org/downloads, GADM https://gadm.org/download_country.html
+
+Vaccination coverage estimates from Robert Kock Institut https://robert-koch-institut.github.io/Inanspruchnahme_von_Routineimpfungen_in_Deutschland-Ergebnisse_aus_der_KV-Impfsurveillance/
+
+```{r}
+ger_ipd_raw <- read_csv("data/DE_IPD_deidentified.csv")
+
+ger_ipd <- ger_ipd_raw |> 
+  mutate(date = as.Date(DateOfIsolation, format = "%d/%m/%Y")) |> 
+  filter(!is.na(PLZpatient) & date > as.Date("2009-01-01")) |> 
+  mutate(plz = str_pad(PLZpatient, side = "left", pad = "0", width = 3)) |> 
+  group_by(plz, Serotype) |> 
+  summarise(ipd_st = n()) |> 
+  group_by(plz) |> 
+  mutate(ipd = sum(ipd_st)) |> 
+  ungroup() |> 
+  filter(Serotype == "19F") |> 
+  mutate(ratio_19F = ipd_st/ipd)
+
+ger_shp <- read_sf("data/plz-3stellig.shp")
+
+ger_outline <- ger_shp |> 
+  summarise(geometry = st_union(geometry))
+
+ger_ipd_sf <- ger_shp |> 
+  left_join(ger_ipd, by = "plz") |> 
+  mutate(plz = factor(plz)) |> 
+  ungroup()
+```
+
+```{r}
+ger_ipd_sf |> 
+  ggplot() +
+  geom_sf(aes(fill = ratio_19F), color = NA) +
+  scale_fill_viridis_c() +
+  theme_void()
+```
+
+#### Moran's
+
+```{r}
+ger_ipd_sf2 <- ger_ipd_sf |> 
+  filter(!is.na(ratio_19F))
+
+nb <- poly2nb(ger_ipd_sf2, queen = TRUE)
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+moran.t <- moran.test(ger_ipd_sf2$ratio_19F, lw)
+
+glance_htest <- function(ht) c(ht$estimate,
+                               "Std deviate" = unname(ht$statistic),
+                               "p.value" = unname(ht$p.value))
+
+moran.t |> 
+  glance_htest() |> 
+  data.frame()
+```
+
+```{r}
+lcl_moran <- localmoran(ger_ipd_sf2$ratio_19F, lw)
+lcl_moran_full <- cbind(ger_ipd_sf2, lcl_moran) |> 
+  mutate(stat = if_else(Pr.z....E.Ii.. < 0.05, Ii, NA),
+         lag_ratio = lag.listw(lw, ratio_19F),
+         lisa = case_when(
+           ratio_19F > mean(ratio_19F) & lag_ratio > mean(lag_ratio) ~ "High - High",
+           ratio_19F < mean(ratio_19F) & lag_ratio < mean(lag_ratio) ~ "Low - Low",
+           ratio_19F < mean(ratio_19F) & lag_ratio > mean(lag_ratio) ~ "Low - High",
+           ratio_19F > mean(ratio_19F) & lag_ratio < mean(lag_ratio) ~ "High - Low"
+         ),
+         lisa_sig = if_else(!is.na(stat), lisa, NA))
+
+lcl_moran_full |> 
+  ggplot() +
+  geom_sf(aes(fill = stat)) +
+  scale_fill_gradient2(low = "#d7191c", mid = "#ffffbf", high = "#1a9641", na.value = "white", limits = c(-1.2, 1.2)) +
+  theme_void() +
+  labs(fill = "Local Moran \nstatistic")
+
+lcl_moran_full |> 
+  ggplot() +
+  geom_sf(aes(fill = lisa_sig)) +
+  theme_void() +
+  labs(fill = "Cluster category")
+```
+
+#### INLA - BYM
+
+```{r}
+nb2 <- poly2nb(ger_ipd_sf, queen = TRUE)
+nb2INLA("map.adj", nb2)
+g <- inla.read.graph(filename = "map.adj")
+
+ger_ipd_new <- ger_ipd_sf |> 
+  st_drop_geometry() |> 
+  ungroup() |> 
+  mutate(idarea = row_number())
+
+data_inla <- list(
+  cases_19F = ger_ipd_new$ipd_st,
+  total_cases = ger_ipd_new$ipd,
+  N = ger_ipd_new$ipd,
+  idarea = ger_ipd_new$idarea
+)
+
+formula <- cases_19F ~ 1 + f(idarea, model = "bym2", graph = g)
+
+result_bym <- inla(
+  formula, 
+  family = "binomial",
+  data = data_inla, 
+  Ntrials = data_inla$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+
+summary(result_bym)
+
+bym_st <- ger_ipd_sf |> 
+  cbind(result_bym$summary.random$idarea[1:671, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst <- ger_ipd_sf |> 
+  cbind(result_bym$summary.random$idarea[672:1342, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_st |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects") +
+  theme_void()
+
+bym_unst |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects") +
+  theme_void()
+```
+
+#### INLA - SPDE
+
+```{r}
+ger_ipd_spde <- ger_ipd_sf |> 
+  st_transform(crs = 3035) |> 
+  mutate(geometry = st_centroid(geometry))
+
+coords <- st_coordinates(ger_ipd_spde)
+
+mesh <- inla.mesh.2d(loc = coords, max.edge = c(50000, 200000), cutoff = 5000)
+
+spde <- inla.spde2.matern(mesh)
+
+s.index <- inla.spde.make.index(name = "spatial.field", n.spde = spde$n.spde)
+
+A.est = inla.spde.make.A(mesh = mesh,
+                         loc = as.matrix(coords))
+
+stack = inla.stack(data = list(cases_19F = ger_ipd_spde$ipd_st,
+                               total_cases = ger_ipd_spde$ipd,
+                               N = ger_ipd_spde$ipd),
+                   A = list(A.est),
+                   effects = list(spatial_field = data.frame(s.index, Intercept = 1)),
+                   tag = 'stdata')
+
+f2 <- cases_19F ~ -1 + f(spatial.field, model = spde) 
+
+result_spde <- inla(
+  f2,
+  family = "binomial",
+  data = inla.stack.data(stack),
+  Ntrials = inla.stack.data(stack)$N,
+  control.predictor = list(A = inla.stack.A(stack)),
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+```
+
+```{r}
+coords2 <- spde$mesh$loc
+
+xrange <- seq(min(coords2[, 1]), max(coords2[, 1]), length.out = 100)
+yrange <- seq(min(coords2[, 2]), max(coords2[, 2]), length.out = 100)
+
+grid_spde <- expand.grid(x = xrange, y = yrange)
+coordinates(grid_spde) <- ~x + y
+proj_grid_spde <- inla.mesh.projector(spde$mesh, xlim = range(xrange), ylim = range(yrange), dims = c(100, 100))
+
+spatial_mean <- inla.mesh.project(proj_grid_spde, result_spde$summary.random$spatial.field$mean)
+spatial_lb <- inla.mesh.project(proj_grid_spde, result_spde$summary.random$spatial.field$`0.025quant`)
+spatial_ub <- inla.mesh.project(proj_grid_spde, result_spde$summary.random$spatial.field$`0.975quant`)
+
+grid_spde$mean <- as.vector(spatial_mean)
+grid_spde$lb <- as.vector(spatial_lb)
+grid_spde$ub <- as.vector(spatial_ub)
+
+grid_sf <- as.data.frame(grid_spde) |> 
+  st_as_sf(coords = c("x", "y"), remove = FALSE, crs = 3035) |>
+  st_intersection(ger_outline |> st_transform(crs = 3035)) |> 
+  mutate(sig = case_when(lb > 0 & ub > 0 ~ 1,
+                         lb < 0 & ub < 0 ~ 1,
+                         .default = 0))
+
+grid_sf |> 
+  ggplot() +
+  geom_tile(aes(x = x, y = y, fill = mean)) +
+  geom_sf(data = ger_outline, fill = NA, color = "black") +
+  scale_fill_viridis_c(option = "plasma") +
+  theme_void()
+```
+
+### Federal state
+
+https://public.opendatasoft.com/explore/dataset/georef-germany-land/export/?flg=en-us&disjunctive.lan_code&disjunctive.lan_name
+
+```{r}
+ger_ipd_st <- ger_ipd_raw |> 
+  mutate(date = as.Date(DateOfIsolation, format = "%d/%m/%Y")) |> 
+  filter(!is.na(BLpatient) & date > as.Date("2009-01-01")) |> 
+  mutate(bl = str_to_upper(BLpatient)) |> 
+  group_by(bl, Serotype) |> 
+  summarise(ipd_st = n()) |> 
+  group_by(bl) |> 
+  mutate(ipd = sum(ipd_st)) |> 
+  ungroup() |> 
+  filter(Serotype == "19F") |> 
+  mutate(ratio_19F = ipd_st/ipd)
+
+ger_bl_shp <- read_sf("data/georef-germany-land-millesime.shp") |> 
+  mutate(lan_code = str_remove(lan_code, "\\['"),
+         lan_code = str_remove(lan_code, "'\\]"),
+         lan_name = str_remove(lan_name, "\\['"),
+         lan_name = str_remove(lan_name, "'\\]"),
+         bl = case_when(lan_code == "01" ~ "SH",
+                        lan_code == "02" ~ "HH",
+                        lan_code == "03" ~ "NI",
+                        lan_code == "04" ~ "HB",
+                        lan_code == "05" ~ "NW",
+                        lan_code == "06" ~ "HE",
+                        lan_code == "07" ~ "RP",
+                        lan_code == "08" ~ "BW",
+                        lan_code == "09" ~ "BY",
+                        lan_code == "10" ~ "SL",
+                        lan_code == "11" ~ "BE",
+                        lan_code == "12" ~ "BB",
+                        lan_code == "13" ~ "MV",
+                        lan_code == "14" ~ "SN",
+                        lan_code == "15" ~ "ST",
+                        lan_code == "16" ~ "TH"))
+
+ger_ipd_state <- ger_bl_shp |> 
+  left_join(ger_ipd_st, by = "bl") |> 
+  mutate(bl = factor(bl)) |> 
+  ungroup()
+```
+
+```{r}
+ger_ipd_state |> 
+  ggplot() +
+  geom_sf(aes(fill = ratio_19F), color = NA) +
+  scale_fill_viridis_c() +
+  theme_void()
+```
+
+#### Moran's
+
+```{r}
+nb_state <- poly2nb(ger_ipd_state, queen = TRUE)
+lw_state <- nb2listw(nb_state, style = "W", zero.policy = TRUE)
+
+moran.t_state <- moran.test(ger_ipd_state$ratio_19F, lw_state)
+
+moran.t_state |> 
+  glance_htest() |> 
+  data.frame()
+```
+
+```{r}
+lcl_moran_state <- localmoran(ger_ipd_state$ratio_19F, lw_state)
+lcl_moran_full_state <- cbind(ger_ipd_state, lcl_moran_state) |> 
+  mutate(stat = if_else(Pr.z....E.Ii.. < 0.05, Ii, NA),
+         lag_ratio = lag.listw(lw_state, ratio_19F),
+         lisa = case_when(
+           ratio_19F > mean(ratio_19F) & lag_ratio > mean(lag_ratio) ~ "High - High",
+           ratio_19F < mean(ratio_19F) & lag_ratio < mean(lag_ratio) ~ "Low - Low",
+           ratio_19F < mean(ratio_19F) & lag_ratio > mean(lag_ratio) ~ "Low - High",
+           ratio_19F > mean(ratio_19F) & lag_ratio < mean(lag_ratio) ~ "High - Low"
+         ),
+         lisa_sig = if_else(!is.na(stat), lisa, NA))
+
+lcl_moran_full_state |> 
+  ggplot() +
+  geom_sf(aes(fill = stat)) +
+  scale_fill_gradient2(low = "#d7191c", mid = "#ffffbf", high = "#1a9641", na.value = "white", limits = c(-1.2, 1.2)) +
+  theme_void() +
+  labs(fill = "Local Moran \nstatistic")
+
+lcl_moran_full_state |> 
+  ggplot() +
+  geom_sf(aes(fill = lisa_sig)) +
+  theme_void() +
+  labs(fill = "Cluster category")
+```
+
+#### INLA - BYM
+
+```{r}
+nb2INLA("map_state.adj", nb_state)
+g_state <- inla.read.graph(filename = "map_state.adj")
+
+ger_ipd_state_new <- ger_ipd_state |> 
+  st_drop_geometry() |> 
+  ungroup() |> 
+  mutate(idarea = row_number())
+
+data_inla_state <- list(
+  cases_19F = ger_ipd_state_new$ipd_st,
+  total_cases = ger_ipd_state_new$ipd,
+  N = ger_ipd_state_new$ipd,
+  idarea = ger_ipd_state_new$idarea
+)
+
+f3 <- cases_19F ~ 1 + f(idarea, model = "bym2", graph = g_state)
+
+result_bym_state <- inla(
+  f3, 
+  family = "binomial",
+  data = data_inla_state, 
+  Ntrials = data_inla_state$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+
+summary(result_bym_state)
+
+bym_state_st <- ger_ipd_state |> 
+  cbind(result_bym_state$summary.random$idarea[1:16, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_state_unst <- ger_ipd_state |> 
+  cbind(result_bym_state$summary.random$idarea[17:32, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+state_structured <- bym_state_st |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects") +
+  theme_void()
+
+state_unstructured <- bym_state_unst |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects") +
+  theme_void()
+
+plot_grid(state_structured, state_unstructured, ncol = 2)
+```
+
+### First two digits of plz
+
+```{r}
+ger_plz2 <- ger_shp |> 
+  mutate(plz_2 = substr(plz, 1, 2)) |> 
+  group_by(plz_2) |> 
+  summarise(geometry = st_union(geometry))
+
+ger_ipd_plz2 <- ger_ipd_raw |> 
+  mutate(date = as.Date(DateOfIsolation, format = "%d/%m/%Y")) |> 
+  filter(!is.na(PLZpatient) & date > as.Date("2009-01-01")) |> 
+  mutate(plz = str_pad(PLZpatient, side = "left", pad = "0", width = 3),
+         plz_2 = substr(plz, 1, 2)) |> 
+  group_by(plz_2, Serotype) |> 
+  summarise(ipd_st = n()) |> 
+  group_by(plz_2) |> 
+  mutate(ipd = sum(ipd_st)) |> 
+  ungroup() |> 
+  filter(Serotype == "19F") |> 
+  mutate(ratio_19F = ipd_st/ipd)
+
+ger_ipd_plz2_sf <- ger_plz2 |> 
+  left_join(ger_ipd_plz2, by = "plz_2") |> 
+  mutate(plz_2 = factor(plz_2)) |> 
+  ungroup()
+```
+
+```{r}
+ger_ipd_plz2_sf |> 
+  ggplot() +
+  geom_sf(aes(fill = ratio_19F), color = NA) +
+  scale_fill_viridis_c() +
+  theme_void()
+```
+
+#### Moran's
+
+```{r}
+nb3 <- poly2nb(ger_ipd_plz2_sf, queen = TRUE)
+lw3 <- nb2listw(nb3, style = "W", zero.policy = TRUE)
+
+moran.t_plz2 <- moran.test(ger_ipd_plz2_sf$ratio_19F, lw3)
+
+moran.t_plz2 |> 
+  glance_htest() |> 
+  data.frame()
+```
+
+```{r}
+lcl_moran_plz2 <- localmoran(ger_ipd_plz2_sf$ratio_19F, lw3)
+lcl_moran_full_plz2 <- cbind(ger_ipd_plz2_sf, lcl_moran_plz2) |> 
+  mutate(stat = if_else(Pr.z....E.Ii.. < 0.05, Ii, NA),
+         lag_ratio = lag.listw(lw3, ratio_19F),
+         lisa = case_when(
+           ratio_19F > mean(ratio_19F) & lag_ratio > mean(lag_ratio) ~ "High - High",
+           ratio_19F < mean(ratio_19F) & lag_ratio < mean(lag_ratio) ~ "Low - Low",
+           ratio_19F < mean(ratio_19F) & lag_ratio > mean(lag_ratio) ~ "Low - High",
+           ratio_19F > mean(ratio_19F) & lag_ratio < mean(lag_ratio) ~ "High - Low"
+         ),
+         lisa_sig = if_else(!is.na(stat), lisa, NA))
+
+lcl_moran_full_plz2 |> 
+  ggplot() +
+  geom_sf(aes(fill = stat)) +
+  scale_fill_gradient2(low = "#d7191c", mid = "#ffffbf", high = "#1a9641", na.value = "white", limits = c(-1.2, 1.2)) +
+  theme_void() +
+  labs(fill = "Local Moran \nstatistic")
+
+lcl_moran_full_plz2 |> 
+  ggplot() +
+  geom_sf(aes(fill = lisa_sig)) +
+  theme_void() +
+  labs(fill = "Cluster category")
+```
+
+#### INLA - BYM
+
+```{r}
+nb2INLA("map_plz2.adj", nb3)
+g_plz2 <- inla.read.graph(filename = "map_plz2.adj")
+
+plz2_db <- ger_ipd_plz2_sf |> 
+  st_drop_geometry() |> 
+  ungroup() |> 
+  mutate(idarea = row_number())
+
+data_inla_plz2 <- list(
+  cases_19F = plz2_db$ipd_st,
+  total_cases = plz2_db$ipd,
+  N = plz2_db$ipd,
+  idarea = plz2_db$idarea
+)
+
+f4 <- cases_19F ~ 1 + f(idarea, model = "bym2", graph = g_plz2)
+
+result_bym_plz2 <- inla(
+  f4, 
+  family = "binomial",
+  data = data_inla_plz2, 
+  Ntrials = data_inla_plz2$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+
+summary(result_bym_plz2)
+
+bym_st_plz2 <- ger_ipd_plz2_sf |> 
+  cbind(result_bym_plz2$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_plz2 <- ger_ipd_plz2_sf |> 
+  cbind(result_bym_plz2$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+plz2_structured <- bym_st_plz2 |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects") +
+  theme_void()
+
+plz2_unstructured <- bym_unst_plz2 |> 
+  ggplot() +
+  geom_sf(aes(fill = mean), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects") +
+  theme_void()
+
+plot_grid(plz2_structured, plz2_unstructured, ncol = 2)
+```

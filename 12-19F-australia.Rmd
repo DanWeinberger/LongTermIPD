@@ -1,0 +1,168 @@
+---
+title: "19F in Australia"
+author: "Paloma Cárcamo"
+date: "2024-10-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+if (!require("pacman")) install.packages("pacman")
+pacman::p_unload(pacman::p_loaded(), character.only = TRUE)
+pacman::p_load(tidyverse, sf, spdep, INLA, cowplot)
+```
+
+Shapefile from https://www.abs.gov.au/statistics/standards/australian-statistical-geography-standard-asgs-edition-3/jul2021-jun2026/access-and-downloads/digital-boundary-files
+
+```{r}
+aus_raw <- readxl::read_xlsx("data/aus_ipd.xlsx", skip = 1)
+
+aus <- aus_raw |> 
+  rename(year = Year,
+         st = Serotype,
+         state = State)  |> 
+  mutate(state = if_else(state == "NSW/ACT", "NSW", state)) |> 
+  group_by(year, st, state) |> 
+  summarise(N_IPD = n()) |> 
+  group_by(year) |> 
+  mutate(IPD_total = sum(N_IPD)) |> 
+  ungroup() |> 
+  filter(st == "19F") |> 
+  rename(IPD_19F = N_IPD) |> 
+  mutate(prop_19F = IPD_19F/IPD_total)
+
+aus_shp <- read_sf("data/aus-states-terr.shp") |> 
+  mutate(state = case_when(STE_NAME21 == "New South Wales" ~ "NSW",
+                           STE_NAME21 == "Australian Capital Territory" ~ "NSW",
+                           STE_NAME21 == "Northern Territory" ~ "NT",
+                           STE_NAME21 == "Queensland" ~ "Qld",
+                           STE_NAME21 == "South Australia" ~ "SA",
+                           STE_NAME21 == "Victoria" ~ "Vic/Tas",
+                           STE_NAME21 == "Tasmania" ~ "Vic/Tas",
+                           .default = STE_NAME21)) |> 
+  group_by(state) |> 
+  summarise(geometry = st_union(geometry))
+
+aus_coverage <- readxl::read_xlsx("data/australia-coverage-state.xlsx") |> 
+  rename(state = area) |> 
+  mutate(state = case_when(state == "QLD" ~ "Qld",
+                           state == "TAS" ~ "Vic/Tas",
+                           state == "VIC" ~ "Vic/Tas",
+                           .default = state)) |> 
+  filter(state != "Country") |> 
+  group_by(year, state) |> 
+  summarise(coverage = mean(overall)) |> 
+  ungroup()
+```
+
+### Bivariate maps
+
+(not super helpful)
+
+```{r, fig.width = 11}
+pacman::p_load(biscale)
+
+prop_biv <- aus_coverage |> 
+  filter(!is.na(coverage)) |> 
+  left_join(aus, by = c("state", "year")) |> 
+  filter(!is.na(prop_19F)) |> 
+  bi_class(x = coverage, y = prop_19F, style = "quantile", dim = 3) |> 
+  right_join(aus_shp |> st_drop_geometry() |> dplyr::select(state), by = "state") |> 
+  complete(state, year, fill = list(prop_19F = NA, coverage = NA)) |> 
+  filter(!is.na(year))
+
+legend <- bi_legend(pal = "GrPink",
+                    dim = 3,
+                    xlab = "Vax coverage",
+                    ylab = "19F proportion",
+                    size = 8)
+maps <- aus_shp |> 
+  right_join(prop_biv, by = "state") |> 
+  ggplot() +
+  geom_sf(aes(fill = bi_class), color = "black", show.legend = FALSE) +
+  bi_scale_fill(pal = "GrPink", dim = 3) +
+  facet_wrap(~year) +
+  theme_void()
+
+(maps_leg <- ggdraw() +
+  draw_plot(maps) +
+  draw_plot(legend, x = 0.55, y = 0.1, 0.3, 0.3))
+```
+
+```{r}
+delta_biv <- aus_coverage |> 
+  filter(!is.na(coverage)) |> 
+  left_join(aus, by = c("state", "year")) |> 
+  group_by(state) |> 
+  arrange(year) |> 
+  mutate(IPD_19F_lag = lag(IPD_19F),
+         prop_lag = lag(prop_19F)) |> 
+  ungroup() |> 
+  rowwise() |> 
+  mutate(delta_ipd19f = IPD_19F - IPD_19F_lag,
+         delta_prop = prop_19F - prop_lag) |> 
+  ungroup() |> 
+  filter(!is.na(delta_ipd19f)) |> 
+  mutate(delta_bin_ipd = if_else(delta_ipd19f > 0, 1, -1),
+         delta_bin_prop = if_else(delta_prop > 0, 1, -1)) |> 
+  bi_class(x = coverage, y = delta_bin_ipd, style = "equal", dim = 2) |> 
+  right_join(aus_shp |> st_drop_geometry() |> dplyr::select(state), by = "state") |> 
+  complete(state, year, fill = list(prop_19F = NA, coverage = NA)) |> 
+  filter(!is.na(year))
+
+legend2 <- bi_legend(pal = "GrPink",
+                    dim = 2,
+                    xlab = "Higher vax coverage",
+                    ylab = "Yearly delta 19F cases",
+                    size = 6)
+maps2 <- aus_shp |> 
+  right_join(delta_biv, by = "state") |> 
+  ggplot() +
+  geom_sf(aes(fill = bi_class), color = "black", show.legend = FALSE) +
+  bi_scale_fill(pal = "GrPink", dim = 2) +
+  facet_wrap(~year) +
+  theme_void()
+
+(maps_leg2 <- ggdraw() +
+  draw_plot(maps2) +
+  draw_plot(legend2, x = 0.55, y = 0.1, 0.3, 0.3))
+```
+
+### Aggregating 2009-2011 and 2013-2015
+
+```{r}
+agg_aus <- aus_coverage |> 
+  filter(!is.na(coverage)) |> 
+  left_join(aus, by = c("state", "year")) |> 
+  mutate(baseline = if_else(year %in% c(2009, 2010, 2011), "before", "after")) |> 
+  group_by(state, baseline) |> 
+  summarise(IPD_19F = mean(IPD_19F, na.rm = TRUE),
+            IPD_total = mean(IPD_total, na.rm = TRUE),
+            coverage = mean(coverage, na.rm = TRUE)) |> 
+  ungroup() |> 
+  mutate(prop_19F = IPD_19F/IPD_total) |> 
+  filter(!is.na(prop_19F)) |> 
+  select(-IPD_total) |> 
+  pivot_wider(names_from = baseline, values_from = c(IPD_19F, coverage, prop_19F)) |> 
+  mutate(ratio_cases = IPD_19F_after/IPD_19F_before,
+         ratio_prop = prop_19F_after/prop_19F_before) |> 
+  bi_class(x = ratio_cases, y = coverage_after, style = "quantile", dim = 3) |> 
+  right_join(aus_shp |> st_drop_geometry() |> dplyr::select(state), by = "state") 
+
+legend3 <- bi_legend(pal = "GrPink",
+                    dim = 2,
+                    xlab = "Higher vax coverage",
+                    ylab = "Yearly delta 19F cases",
+                    size = 6)
+maps3 <- aus_shp |> 
+  right_join(agg_aus, by = "state") |> 
+  ggplot() +
+  geom_sf(aes(fill = bi_class), color = "black", show.legend = FALSE) +
+  bi_scale_fill(pal = "GrPink", dim = 3) +
+  theme_void()
+
+(maps_leg2 <- ggdraw() +
+  draw_plot(maps2) +
+  draw_plot(legend2, x = 0.55, y = 0.1, 0.3, 0.3))
+```
+

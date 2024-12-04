@@ -1,0 +1,459 @@
+---
+title: "Long term trends in IPD in the US"
+output: html
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(viridis)
+library(plotly)
+library(scales)
+library(pheatmap)
+#install.packages("waffle", repos = "https://cinc.rud.is") 
+library(reshape2)
+library(HDInterval)
+library(rjags)
+library(stringr)
+library(tidyr)
+
+```
+
+
+US ABCs serotype specific IPD data by age
+
+Download the data
+```{r, eval=F}
+ s1 <- read.csv('https://data.cdc.gov/api/views/qvzb-qs6p/rows.csv?accessType=DOWNLOAD')
+ saveRDS(s1,'./Data/ABCs_st_1998_2021.rds') 
+```
+
+Create time series by serotype and year
+
+```{r, fig.width=5, fig.height=10}
+s1 <- readRDS('./Data/ABCs_st_1998_2021.rds') %>%
+  rename(agec = "Age.Group..years.",
+         year=Year,
+         st=IPD.Serotype,
+         N_IPD = Frequency.Count) %>%
+  mutate( st= if_else(st=='16','16F', st)) %>%
+  group_by(st, year) %>%
+  summarize(N_IPD=sum(N_IPD)) %>%
+  ungroup()
+```
+Heatmap to vizualize trends over entire time period
+
+```{r}
+
+p1 <- s1 %>%
+    group_by(st, year) %>%
+  summarize(N_IPD=sum(N_IPD)) %>%
+  ggplot(aes(x=year, y=log(N_IPD+0.5), group=st, color=st)) +
+  geom_line()+
+  theme_minimal()
+ggplotly(p1)
+
+#pre PCV7 mean
+s2_pre<- s1 %>%
+  filter(year %in% c(1998, 1999)) %>%
+  group_by(st, year) %>%
+  summarize(N_IPD=sum(N_IPD)) %>%
+  ungroup() %>%
+    group_by(st) %>%
+  summarize(N_IPD_pre=mean(N_IPD)) %>%
+  ungroup() %>%
+    tidyr::complete(st,  fill=list(N_IPD_pre=0))  #fills 0
+
+
+s2<- s1 %>%
+    group_by(st, year) %>%
+  summarize(N_IPD=sum(N_IPD)) %>% #sum across age group
+  ungroup() %>%
+    tidyr::complete(st, year, fill=list(N_IPD=0))%>%  #fills 0
+  left_join(s2_pre, by='st') %>%
+  mutate(N_IPD_pre = if_else(is.na(N_IPD_pre),0, N_IPD_pre) ,
+    logRR = log((N_IPD+1)/(N_IPD_pre+1) )) 
+
+max_RR <- s2 %>%
+  group_by(st) %>%
+  summarize(max_RR = max(logRR)) %>%
+  arrange((max_RR))
+
+s2$st <- factor(s2$st, levels = max_RR$st)
+
+df_wide <- s2 %>%
+  dplyr::select(year, st, logRR) %>%
+  tidyr::pivot_wider(names_from = year, values_from = logRR)
+
+pheatmap(
+  df_wide[,-1],
+  color = viridis(100),
+  cluster_rows = TRUE,
+  cluster_cols = F,
+  scale = "none",
+  border_color = NA,
+  labels_row=df_wide$st
+)
+
+
+```
+
+pre-PCV13 heatmap only
+```{r, fig.width=5, fig.height=10}
+
+#pre PCV13 mean
+
+s2_pre13<- s1 %>%
+  filter(year %in% c(2008, 2009)) %>%
+  group_by(st, year) %>%
+  summarize(N_IPD=sum(N_IPD)) %>%
+  ungroup() %>%
+    group_by(st) %>%
+  summarize(N_IPD_pre=mean(N_IPD)) %>%
+  ungroup() %>%
+    tidyr::complete(st,  fill=list(N_IPD_pre=0))  #fills 0
+
+df_wide <- s2 %>%
+  filter(year<=2009) %>%
+  dplyr::select(year, st, logRR) %>%
+  tidyr::pivot_wider(names_from = year, values_from = logRR)
+
+pheatmap(
+  df_wide[,-1],
+  color = viridis(100),
+  cluster_rows = TRUE,
+  cluster_cols = F,
+  scale = "none",
+  border_color = NA,
+  labels_row=df_wide$st
+)
+```
+
+##post PV13 only
+
+```{r, fig.width=5, fig.height=10}
+s2_13<- s1 %>%
+    group_by(st, year) %>%
+  summarize(N_IPD=sum(N_IPD)) %>% #sum across age group
+  ungroup() %>%
+    tidyr::complete(st, year, fill=list(N_IPD=0))%>%  #fills 0
+  left_join(s2_pre13, by='st') %>%
+  mutate(N_IPD_pre = if_else(is.na(N_IPD_pre),0, N_IPD_pre) ,
+    logRR13 = log((N_IPD+1)/(N_IPD_pre+1) )) 
+
+
+df_wide13 <- s2_13 %>%
+  dplyr::select(year, st, logRR13) %>%
+  filter(year>=2010) %>%
+  tidyr::pivot_wider(names_from = year, values_from = logRR13)
+
+pheatmap(
+  df_wide13[,-1],
+  color = viridis(100),
+  cluster_rows = TRUE,
+  cluster_cols = F,
+  scale = "none",
+  border_color = NA,
+  labels_row=df_wide13$st
+)
+```
+
+Trends in PCV7 serotypes over time
+```{r}
+s1 %>%
+  filter(st %in% c('4','6B','9V','14','18C','19F','23F')) %>%
+  ggplot(aes(x=year, y=log(N_IPD)))+
+  geom_line()+
+  facet_wrap(~st, scales ='free') +
+  theme_classic()+
+  geom_vline(xintercept=c(1999.5, 2009.5), lty=2, color='gray')+
+  ggtitle('Trends in PCV7 serotypes')
+
+```
+
+Trends in PCV7 serotypes over time, by Age
+
+```{r, fig.width=14, fig.height=12}
+ readRDS('./Data/ABCs_st_1998_2021.rds') %>%
+  rename(agec = "Age.Group..years.",
+         year=Year,
+         st=IPD.Serotype,
+         N_IPD = Frequency.Count) %>%
+  mutate( st= if_else(st=='16','16F', st),
+          agec1 = if_else(agec %in% c("Age <2","Age 2-4") ,1,2 )) %>%
+  group_by(st,agec, year) %>%
+  summarize(N_IPD=sum(N_IPD)) %>%
+  ungroup()%>%
+   filter(st %in% c('4','6B','9V','14','18C','19A','19F','23F')) %>%
+  ggplot(aes(x=year, y=log(N_IPD+1)))+
+  geom_line()+
+  facet_grid(agec~st, scales ='free') +
+  theme_classic()+
+  geom_vline(xintercept=c(1999.5, 2009.5), lty=2, color='gray')+
+  ggtitle('Trends in PCV7 serotypes')
+```
+## Simple JAGS model
+
+This model will fit a simple AR(1) model to data for one serotype
+
+## Prepare the data
+```{r}
+mod.ds <- s1 %>%
+  tidyr::complete(st,year,  fill=list(N_IPD=0)) %>%  #fills 0
+  arrange(st, year) %>%
+  filter(st== '4') %>%
+  group_by(st) %>%
+  arrange(year) %>%
+  mutate(yearN= row_number()) %>%
+  ungroup()
+```
+
+
+### Define the model 
+```{r}
+
+model_string_single <- "
+
+model{
+for(i in 1:N_years){
+
+  N_IPD[i] ~ dnegbin(prob[i],r)
+  prob[i]<- r/(r+lambda[i])  ## likelihood 
+
+  log(lambda[i]) <-  beta1[i]
+
+}
+
+  beta1[1] ~ dnorm(mu, (1 - rho1^2) * tau.beta1) # Prior for the first time point
+  for(j in 2:N_years){
+    beta1[j] ~ dnorm(mu+ rho1 * beta1[j-1], tau.beta1)
+  }
+
+  tau.beta1 ~ dgamma(3, 2)  # Tight prior for tau 
+  rho1 ~ dunif(-1, 1)       # Uniform prior for rho
+
+  mu ~ dnorm(0, 1e-4)   # Uninformative prior for intercept
+  
+  r ~ dunif(0,250)
+
+}
+"
+```
+
+### Set random seeds. 
+We are going to run 3 chains in the MCMC, so we need a seed for each. This ensures reproducible results.
+
+```{r}
+inits1=list(".RNG.seed"=c(123), ".RNG.name"='base::Wichmann-Hill')
+inits2=list(".RNG.seed"=c(456), ".RNG.name"='base::Wichmann-Hill')
+inits3=list(".RNG.seed"=c(789), ".RNG.name"='base::Wichmann-Hill')
+```
+
+### Initialize the model
+```{r}
+model_spec<-textConnection(model_string_single)
+model_jags<-jags.model(model_spec,
+                       inits=list(inits1,inits2, inits3),
+                       data=list('N_IPD'= mod.ds$N_IPD  ,
+                                 'N_years'=max(mod.ds$yearN)
+                       ),
+                       n.adapt=10000,
+                       n.chains=3, quiet=T)
+```
+
+### Posterior sampling
+
+what parameters do you want to sample?
+```{r}
+params<-c('rho1', 'mu','beta1','tau.beta1','lambda')
+
+```
+
+```{r}
+posterior_samples<-coda.samples(model_jags, 
+                                params, 
+                                n.iter=10000)
+```
+
+Plot the trace plots
+
+```{r, fig.width=7, fig.height=7}
+plot(posterior_samples, ask=T)
+```
+
+
+```{r}
+posterior_samples.all<-do.call(rbind,posterior_samples) #combine 3 chains into 1 data frame
+
+post_means<-apply(posterior_samples.all, 2, mean)
+sample.labs<-names(post_means)
+ci<-t(hdi(posterior_samples.all, credMass = 0.95))
+#ci<-matrix(sprintf("%.1f",round(ci,1)), ncol=2)
+ci<-matrix(ci, ncol=2)
+
+row.names(ci)<-sample.labs
+#post_means<-sprintf("%.1f",round(post_means,1))
+names(post_means)<-sample.labs
+
+post_all <- cbind.data.frame(post_means,ci) 
+names(post_all) <- c('pred','pred_lcl','pred_ucl')
+post_all$param <- row.names(post_all)
+```
+
+
+```{r}
+
+pred.ds <- post_all %>%
+  filter(grepl('lambda[',param, fixed=T)) %>%
+  mutate(yearN = as.numeric(str_extract(param,  "(?<=\\[)\\d+(?=\\])"))) %>%
+  ungroup() %>%
+  left_join(mod.ds, by='yearN')
+
+pred.ds%>%
+  ggplot(aes(x=yearN ,y=pred)) +
+  geom_line() +
+  theme_minimal() +
+  geom_ribbon(aes(x=yearN, ymin=pred_lcl, ymax=pred_ucl), alpha=0.5) +
+  geom_point(aes(x=yearN, y=N_IPD))
+
+```
+
+
+## Model for all PCV7 serotypes--with globa effects
+
+```{r}
+mod.ds.pcv7 <- s1 %>%
+  tidyr::complete(st,year,  fill=list(N_IPD=0)) %>%  #fills 0
+  arrange(st, year) %>%
+  filter(st %in% c('4','6B','9V','14','18C','19F','23F')) %>%
+  group_by(st) %>%
+  arrange(year) %>%
+  mutate(yearN= row_number()) %>%
+  ungroup()
+
+mat.pcv7 <- mod.ds.pcv7 %>%
+  reshape2::dcast(year~st, value.var='N_IPD') %>%
+  dplyr::select(-year)
+```
+
+```{r}
+
+model_string_pcv7 <- "
+
+model{
+for(i in 1:N_years){
+  for(j in 1:N_sts){
+
+  N_IPD[i,j] ~ dnegbin(prob[i,j],r[j])
+  prob[i,j]<- r[j]/(r[j]+lambda[i,j])  ## likelihood 
+
+  log(lambda[i,j]) <- epsilon1[i,j] #serotype-specific intercept + AR(1) effect centered around global effects
+
+  }
+}
+
+# global AR(1) effect
+ beta1[1] ~dnorm( alpha1,(1 - rho_beta^2) * tau.beta1 )
+    for(i in 2:N_years){
+      beta1[i] ~ dnorm(alpha1 + rho_beta*beta1[i-1], tau.beta1 )
+    }
+
+#serotype-specifc AR(1)
+  for(j in 1:N_sts){
+    epsilon1[1,j] ~ dnorm(delta1[j] + beta1[1], (1 - rho_eps^2) * tau.eps) 
+  for(i in 2:N_years){
+    epsilon1[i,j] ~ dnorm( delta1[j] + beta1[i] + rho_eps * epsilon1[i-1,j], tau.eps)
+  }
+  }
+  
+ ## priors ##
+    alpha1 ~ dnorm(0,1e-4)
+    tau_global ~dgamma(0.01,0.01)
+
+    rho_beta ~ dunif(-1, 1)       # Uniform prior for rho_beta--global AR(1)
+    rho_eps ~ dunif(-1, 1)  #prior for rho_eps same for all STs
+    
+    tau.beta1 ~ dgamma(3, 2)  # Tight prior for tau, 
+    tau.eps ~ dgamma(3, 2)  # Tight prior for tau, shared for all serotypes
+
+    for(j in 1:N_sts){
+       delta1[j] ~ dnorm(0, tau_global)  # serotype means centered around 0
+       r[j] ~ dunif(0,250) #serotype dispersion parameter
+      }
+    
+}
+"
+```
+
+```{r}
+inits1=list(".RNG.seed"=c(123), ".RNG.name"='base::Wichmann-Hill')
+inits2=list(".RNG.seed"=c(456), ".RNG.name"='base::Wichmann-Hill')
+inits3=list(".RNG.seed"=c(789), ".RNG.name"='base::Wichmann-Hill')
+```
+
+### Initialize the model
+```{r}
+model_spec<-textConnection(model_string_pcv7)
+model_jags_pcv7<-jags.model(model_spec,
+                       inits=list(inits1,inits2, inits3),
+                       data=list('N_IPD'= mat.pcv7  ,
+                                 'N_years'=max(mod.ds.pcv7$yearN),
+                                 'N_sts'=ncol(mat.pcv7)
+                       ),
+                       n.adapt=10000,
+                       n.chains=3, quiet=T)
+
+params<-c('alpha1', 'epsilon1','delta1','beta1','tau.beta1','lambda')
+
+posterior_samples_pcv7 <-coda.samples(model_jags_pcv7, 
+                                params, 
+                                n.iter=10000)
+
+```
+
+```{r}
+posterior_samples.all<-do.call(rbind,posterior_samples_pcv7) #combine 3 chains into 1 data frame
+
+post_means<-apply(posterior_samples.all, 2, mean)
+sample.labs<-names(post_means)
+ci<-t(hdi(posterior_samples.all, credMass = 0.95))
+#ci<-matrix(sprintf("%.1f",round(ci,1)), ncol=2)
+ci<-matrix(ci, ncol=2)
+
+row.names(ci)<-sample.labs
+#post_means<-sprintf("%.1f",round(post_means,1))
+names(post_means)<-sample.labs
+
+post_all <- cbind.data.frame(post_means,ci) 
+names(post_all) <- c('pred','pred_lcl','pred_ucl')
+post_all$param <- row.names(post_all)
+```
+
+```{r}
+pcv_sts <- cbind.data.frame('st'= names(mat.pcv7)) %>%
+  mutate(stN=row_number())
+
+
+preds <- post_all %>%
+  filter(grepl('lambda', param)) %>%
+  mutate(extracted = gsub(".*\\[(.*)\\].*", "\\1", param)
+  ) %>%
+  separate(extracted, into = c("yearN", "stN"), sep = ",") %>%
+  mutate(stN=as.numeric(stN),
+         yearN=as.numeric(yearN)) %>%
+  left_join(pcv_sts, by='stN') %>%
+  left_join(mod.ds.pcv7, by=c('st','yearN')) %>%
+  arrange(st, yearN)
+```
+
+
+```{r, fig.width=10, fig.height=8}
+preds%>%
+  ggplot(aes(x=yearN ,y=pred)) +
+  geom_line() +
+  theme_minimal() +
+  geom_ribbon(aes(x=yearN, ymin=pred_lcl, ymax=pred_ucl), alpha=0.5) +
+  geom_point(aes(x=yearN, y=N_IPD)) +
+  facet_wrap(~st)
+```

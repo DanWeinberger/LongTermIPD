@@ -1,0 +1,1609 @@
+---
+title: "19F in Germany - spatiotemp model"
+author: "Paloma Cárcamo"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+if (!require("pacman")) install.packages("pacman")
+pacman::p_unload(pacman::p_loaded(), character.only = TRUE)
+pacman::p_load(tidyverse, sf, spdep, INLA, cowplot)
+```
+
+## Load data
+
+Missing zipcode: 5685/39315
+
+Shapefiles from GADM https://gadm.org/download_country.html
+
+Vaccination coverage estimates from Robert Koch Institut https://robert-koch-institut.github.io/Inanspruchnahme_von_Routineimpfungen_in_Deutschland-Ergebnisse_aus_der_KV-Impfsurveillance/
+
+```{r}
+ger_ipd_raw <- read_csv("data/DE_IPD_deidentified.csv")
+
+ger_shp_plz <- read_sf("data/plz-2stellig.shp") |> 
+  group_by(plz) |> 
+  summarise(geometry = st_union(geometry))
+
+ger_cov <- readxl::read_xlsx("data/kvis_vax.xlsx")
+
+plz_ags_key <- read_rds("data/interim/plz_ags_key.rds")
+```
+
+```{r}
+ger_cov_agg <- ger_cov |> 
+  filter(vaccine == "Pneumokokken" & age_group == "24 Monate") |> 
+  left_join(plz_ags_key, by = c("county_ags" = "CC_2")) |> 
+  filter(!is.na(plz)) |> 
+  mutate(new_pop = pop_weight*overlap_percentage,
+         vaxed = new_pop*(vacc_rate/100),
+         year = year_birth+2,
+         nyeargroup = cut(year, breaks = c(2008, 2012, 2017, 2022), include.lowest = TRUE, labels = FALSE)) |> 
+  group_by(plz, nyeargroup) |> 
+  summarise(vax_pop = as.numeric(sum(vaxed, na.rm = TRUE)),
+            all_pop = as.numeric(sum(new_pop, na.rm = TRUE))) |> 
+  ungroup() |> 
+  mutate(vacc_rate = vax_pop/all_pop*100,
+         vacc_cat = inla.group(vacc_rate, n = 10, method = "quantile"))
+```
+```{r}
+ger_ipd_plz2 <- ger_ipd_raw |> 
+  mutate(date = as.Date(DateOfIsolation, format = "%d/%m/%Y"),
+         plz = str_pad(PLZpatient, side = "left", pad = "0", width = 3),
+         plz_2 = substr(plz, 1, 2),
+         year = year(date)) |> 
+  filter(!is.na(PLZpatient) & date > as.Date("2009-01-01")) |> 
+  arrange(year) |> 
+  group_by(year) |> 
+  mutate(nyear = cur_group_id()) |> 
+  ungroup() |> 
+  mutate(yeargroup = factor(cut(nyear, 3, labels = FALSE), levels = c(1:3), labels = c("2008-2012", "2013-2017", "2018-2022")),
+         nyeargroup = cut(nyear, 3, labels = FALSE)) |> 
+  group_by(plz_2, Serotype, yeargroup, nyeargroup) |> 
+  summarise(ipd_st = n()) |> 
+  group_by(plz_2, yeargroup, nyeargroup) |> 
+  mutate(ipd = sum(ipd_st)) |> 
+  ungroup() |> 
+  filter(Serotype == "19F") |> 
+  mutate(ratio_19F = ipd_st/ipd) |> 
+  rename(ipd_19F = ipd_st) |> 
+  left_join(ger_cov_agg, by = c("plz_2" = "plz", "nyeargroup"))
+
+ger_ipd_plz2_sf <- ger_shp_plz |> 
+  right_join(ger_ipd_plz2, by = c("plz" = "plz_2")) |> 
+  mutate(plz = factor(plz))
+```
+
+## With 19A
+
+```{r}
+ger_ipd_plz_19a <- ger_ipd_raw |> 
+  mutate(date = as.Date(DateOfIsolation, format = "%d/%m/%Y"),
+         plz = str_pad(PLZpatient, side = "left", pad = "0", width = 3),
+         plz_2 = substr(plz, 1, 2),
+         year = year(date)) |> 
+  filter(!is.na(PLZpatient) & date > as.Date("2009-01-01")) |> 
+  arrange(year) |> 
+  group_by(year) |> 
+  mutate(nyear = cur_group_id()) |> 
+  ungroup() |> 
+  mutate(yeargroup = factor(cut(nyear, 3, labels = FALSE), levels = c(1:3), labels = c("2008-2012", "2013-2017", "2018-2022")),
+         nyeargroup = cut(nyear, 3, labels = FALSE)) |> 
+  group_by(plz_2, Serotype, yeargroup, nyeargroup) |> 
+  summarise(ipd_st = n()) |> 
+  group_by(plz_2, yeargroup, nyeargroup) |> 
+  mutate(ipd = sum(ipd_st)) |> 
+  ungroup() |> 
+  filter(Serotype == "19A") |> 
+  mutate(ratio_19A = ipd_st/ipd) |> 
+  rename(ipd_19A = ipd_st) |> 
+  dplyr::select(plz_2, yeargroup, ipd_19A, ratio_19A)
+
+ger_ipd_19fa <- ger_ipd_plz2 |> 
+  left_join(ger_ipd_plz_19a, by = c("plz_2", "yeargroup"))
+
+ger_ipd_19fa_sf <- ger_shp_plz |> 
+  right_join(ger_ipd_19fa, by = c("plz" = "plz_2")) |> 
+  mutate(plz = factor(plz))
+```
+
+## Visualize
+
+```{r}
+ger_ipd_plz2_sf |> 
+  ggplot() +
+  geom_sf(data = ger_shp_plz, fill = "lightgray", color = NA) +
+  geom_sf(aes(fill = ratio_19F), color = NA) +
+  scale_fill_viridis_c(option = "C") +
+  facet_wrap(~yeargroup) +
+  labs(fill = "Proportion\n19F cases") +
+  theme_void()
+
+ger_ipd_plz2_sf |> 
+  ggplot() +
+  geom_sf(data = ger_shp_plz, fill = "lightgray", color = NA) +
+  geom_sf(aes(fill = vacc_rate), color = NA) +
+  scale_fill_viridis_c(option = "C") +
+  facet_wrap(~yeargroup) +
+  labs(fill = "PCV coverage\nat 24 months") +
+  theme_void()
+```
+
+```{r, fig.width = 11}
+pacman::p_load(biscale)
+
+biv_dat <- bi_class(ger_ipd_plz2_sf, x = vacc_rate, y = ratio_19F, style= "quantile", dim = 3)
+
+biv_map <- biv_dat |> 
+  ggplot() +
+  geom_sf(aes(fill = bi_class), color = NA, show.legend = FALSE) +
+  geom_sf(data = ger_shp_plz, fill = NA, color = "black") +
+  bi_scale_fill(pal = "GrPink", dim = 3) +
+  facet_wrap(~yeargroup) +
+  theme_void() +
+  theme(strip.text = element_text(size = 14))
+
+biv_leg <- bi_legend(pal = "GrPink",
+                     dim = 3,
+                     xlab = "Higher vacc rate ",
+                     ylab = "Higher 19F ",
+                     size = 12)
+
+plot_grid(biv_map, biv_leg, ncol = 2, rel_widths = c(1, 0.25))
+```
+
+
+```{r, fig.width = 11}
+biv_dat2 <- bi_class(ger_ipd_19fa_sf, x = ratio_19A, y = ratio_19F, style= "quantile", dim = 3)
+
+biv_map2 <- biv_dat2 |> 
+  ggplot() +
+  geom_sf(aes(fill = bi_class), color = NA, show.legend = FALSE) +
+  geom_sf(data = ger_shp_plz, fill = NA, color = "black") +
+  bi_scale_fill(pal = "GrPink", dim = 3) +
+  facet_wrap(~yeargroup) +
+  theme_void() +
+  theme(strip.text = element_text(size = 14))
+
+biv_leg2 <- bi_legend(pal = "GrPink",
+                      dim = 3,
+                      xlab = "Higher 19A ",
+                      ylab = "Higher 19F ",
+                      size = 12)
+
+plot_grid(biv_map2, biv_leg2, ncol = 2, rel_widths = c(1, 0.25))
+```
+
+## Model setup
+
+```{r}
+#nb3 <- poly2nb(ger_shp_plz, queen = TRUE)
+#nb2INLA("map_plz2.adj", nb3)
+g_plz2 <- inla.read.graph(filename = "map_plz2.adj")
+
+plz2_db <- ger_shp_plz |> 
+  st_drop_geometry() |> 
+  ungroup() |> 
+  mutate(idarea = row_number()) |> 
+  right_join(ger_ipd_plz2, by = c("plz" = "plz_2"))
+
+data_inla_plz2 <- list(
+  cases_19F = plz2_db$ipd_19F,
+  total_cases = plz2_db$ipd,
+  N = plz2_db$ipd,
+  idarea = plz2_db$idarea,
+  vacc_rate = plz2_db$vacc_rate,
+  vacc_cat = plz2_db$vacc_cat,
+  nyeargroup = plz2_db$nyeargroup
+)
+```
+
+## No vaccine coverage - ar1
+
+```{r}
+f1 <- cases_19F ~ 1 + f(idarea, model = "bym2", graph = g_plz2) + f(nyeargroup, model = "ar1")
+
+result1 <- inla(
+  f1, 
+  family = "binomial",
+  data = data_inla_plz2, 
+  Ntrials = data_inla_plz2$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+```
+
+```{r}
+summary(result1)
+
+bym_st_result1 <- ger_shp_plz |> 
+  cbind(result1$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_result1 <- ger_shp_plz |> 
+  cbind(result1$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+ar1_result1 <- result1$summary.random$nyeargroup |> 
+  left_join(plz2_db |> dplyr::select(nyeargroup, yeargroup) |> distinct(), by = c("ID" = "nyeargroup")) |> 
+  rename(lb = `0.025quant`, ub = `0.975quant`)
+
+ar1_result1 |> 
+  ggplot(aes(x = yeargroup, color = yeargroup)) +
+  geom_errorbar(aes(ymin = exp(lb), ymax = exp(ub)), show.legend = FALSE) +
+  geom_point(aes(y = exp(mean)), show.legend = FALSE) +
+  theme_bw() +
+  labs(x = "", y = "Effect")
+
+structured_result1 <- bym_st_result1 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects", fill = "Effect") +
+  theme_void()
+
+unstructured_result1 <- bym_st_result1 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects", fill = "Effect") +
+  theme_void()
+
+plot_grid(structured_result1, unstructured_result1, ncol = 2)
+```
+
+## No vaccine coverage - rw2
+
+```{r}
+f2 <- cases_19F ~ 1 + f(idarea, model = "bym2", graph = g_plz2) + f(nyeargroup, model = "rw2")
+
+result2 <- inla(
+  f2, 
+  family = "binomial",
+  data = data_inla_plz2, 
+  Ntrials = data_inla_plz2$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+```
+
+```{r}
+summary(result2)
+
+bym_st_result2 <- ger_shp_plz |> 
+  cbind(result2$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_result2 <- ger_shp_plz |> 
+  cbind(result2$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+ar1_result2 <- result2$summary.random$nyeargroup |> 
+  left_join(plz2_db |> dplyr::select(nyeargroup, yeargroup) |> distinct(), by = c("ID" = "nyeargroup")) |> 
+  rename(lb = `0.025quant`, ub = `0.975quant`)
+
+ar1_result2 |> 
+  ggplot(aes(x = yeargroup, color = yeargroup)) +
+  geom_errorbar(aes(ymin = exp(lb), ymax = exp(ub)), show.legend = FALSE) +
+  geom_point(aes(y = exp(mean)), show.legend = FALSE) +
+  theme_bw() +
+  labs(x = "", y = "Effect")
+
+structured_result2 <- bym_st_result2 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects", fill = "Effect") +
+  theme_void()
+
+unstructured_result2 <- bym_st_result2 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects", fill = "Effect") +
+  theme_void()
+
+plot_grid(structured_result2, unstructured_result2, ncol = 2)
+```
+
+## Linear vaccine coverage
+
+```{r}
+f3 <- cases_19F ~ 1 + f(idarea, model = "bym2", graph = g_plz2) + f(nyeargroup, model = "rw2") + vacc_rate
+
+result3 <- inla(
+  f3, 
+  family = "binomial",
+  data = data_inla_plz2, 
+  Ntrials = data_inla_plz2$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+```
+
+```{r}
+summary(result3)
+
+bym_st_result3 <- ger_shp_plz |> 
+  cbind(result3$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_result3 <- ger_shp_plz |> 
+  cbind(result3$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+ar1_result3 <- result3$summary.random$nyeargroup |> 
+  left_join(plz2_db |> dplyr::select(nyeargroup, yeargroup) |> distinct(), by = c("ID" = "nyeargroup")) |> 
+  rename(lb = `0.025quant`, ub = `0.975quant`)
+
+ar1_result3 |> 
+  ggplot(aes(x = yeargroup, color = yeargroup)) +
+  geom_errorbar(aes(ymin = exp(lb), ymax = exp(ub)), show.legend = FALSE) +
+  geom_point(aes(y = exp(mean)), show.legend = FALSE) +
+  theme_bw() +
+  labs(x = "", y = "Effect")
+
+structured_result3 <- bym_st_result3 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects", fill = "Effect") +
+  theme_void()
+
+unstructured_result3 <- bym_st_result3 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects", fill = "Effect") +
+  theme_void()
+
+plot_grid(structured_result3, unstructured_result3, ncol = 2)
+```
+
+## IID vaccine coverage
+
+```{r}
+extraconstr <- list(
+  A = matrix(0, nrow = 1, ncol = length(unique((plz2_db$vacc_cat)))),
+  e = 0
+)
+
+extraconstr$A[1, 1] <- 1
+```
+
+```{r}
+f4 <- cases_19F ~ 1 + f(idarea, model = "bym2", graph = g_plz2) + f(nyeargroup, model = "rw2") + f(vacc_cat, model = "iid", constr = FALSE, extraconstr = extraconstr)
+
+result4 <- inla(
+  f4, 
+  family = "binomial",
+  data = data_inla_plz2, 
+  Ntrials = data_inla_plz2$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+```
+
+```{r}
+summary(result4)
+
+bym_st_result4 <- ger_shp_plz |> 
+  cbind(result4$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_result4 <- ger_shp_plz |> 
+  cbind(result4$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+ar1_result4 <- result4$summary.random$nyeargroup |> 
+  left_join(plz2_db |> dplyr::select(nyeargroup, yeargroup) |> distinct(), by = c("ID" = "nyeargroup")) |> 
+  rename(lb = `0.025quant`, ub = `0.975quant`)
+
+ar1_result4 |> 
+  ggplot(aes(x = yeargroup, color = yeargroup)) +
+  geom_errorbar(aes(ymin = exp(lb), ymax = exp(ub)), show.legend = FALSE) +
+  geom_point(aes(y = exp(mean)), show.legend = FALSE) +
+  theme_bw() +
+  labs(x = "", y = "Effect")
+
+vacc_result4 <- result4$summary.random$vacc_cat
+
+vacc_result4 |> 
+  ggplot(aes(x = ID)) +
+  geom_errorbar(aes(ymin = exp(`0.025quant`), ymax = exp(`0.975quant`))) +
+  geom_point(aes(y = exp(mean))) +
+  labs(x = "Vaccine coverage", y = "Effect") +
+  scale_x_continuous(n.breaks = 6) +
+  theme_bw()
+
+structured_result4 <- bym_st_result4 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects", fill = "Effect") +
+  theme_void()
+
+unstructured_result4 <- bym_st_result4 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects", fill = "Effect") +
+  theme_void()
+
+plot_grid(structured_result4, unstructured_result4, ncol = 2)
+```
+
+## RW1 vaccine coverage
+
+```{r}
+f5 <- cases_19F ~ 1 + f(idarea, model = "bym2", graph = g_plz2) + f(nyeargroup, model = "rw2") + f(vacc_cat, model = "rw1", constr = FALSE, extraconstr = extraconstr)
+
+result5 <- inla(
+  f5, 
+  family = "binomial",
+  data = data_inla_plz2, 
+  Ntrials = data_inla_plz2$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+```
+
+```{r}
+summary(result5)
+
+bym_st_result5 <- ger_shp_plz |> 
+  cbind(result5$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_result5 <- ger_shp_plz |> 
+  cbind(result5$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+vacc_result5 <- result5$summary.random$vacc_cat
+
+vacc_result5 |> 
+  ggplot(aes(x = ID)) +
+  geom_errorbar(aes(ymin = exp(`0.025quant`), ymax = exp(`0.975quant`))) +
+  geom_point(aes(y = exp(mean))) +
+  labs(x = "Vaccine coverage", y = "Effect") +
+  scale_x_continuous(n.breaks = 6) +
+  theme_bw()
+
+ar1_result5 <- result5$summary.random$nyeargroup |> 
+  left_join(plz2_db |> dplyr::select(nyeargroup, yeargroup) |> distinct(), by = c("ID" = "nyeargroup")) |> 
+  rename(lb = `0.025quant`, ub = `0.975quant`)
+
+ar1_result5 |> 
+  ggplot(aes(x = yeargroup, color = yeargroup)) +
+  geom_errorbar(aes(ymin = exp(lb), ymax = exp(ub)), show.legend = FALSE) +
+  geom_point(aes(y = exp(mean)), show.legend = FALSE) +
+  theme_bw() +
+  labs(x = "", y = "Effect")
+
+structured_result5 <- bym_st_result5 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects", fill = "Effect") +
+  theme_void()
+
+unstructured_result5 <- bym_st_result5 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects", fill = "Effect") +
+  theme_void()
+
+plot_grid(structured_result5, unstructured_result5, ncol = 2)
+```
+
+## RW2 vaccine coverage
+
+```{r}
+f6 <- cases_19F ~ 1 + f(idarea, model = "bym2", graph = g_plz2) + f(nyeargroup, model = "rw2") + f(vacc_cat, model = "rw2", constr = FALSE, extraconstr = extraconstr)
+
+result6 <- inla(
+  f6, 
+  family = "binomial",
+  data = data_inla_plz2, 
+  Ntrials = data_inla_plz2$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+```
+
+```{r}
+summary(result6)
+
+bym_st_result6 <- ger_shp_plz |> 
+  cbind(result6$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_result6 <- ger_shp_plz |> 
+  cbind(result6$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+vacc_result6 <- result6$summary.random$vacc_cat
+
+vacc_result6 |> 
+  ggplot(aes(x = ID)) +
+  geom_errorbar(aes(ymin = exp(`0.025quant`), ymax = exp(`0.975quant`))) +
+  geom_point(aes(y = exp(mean))) +
+  labs(x = "Vaccine coverage", y = "Effect") +
+  scale_x_continuous(n.breaks = 6) +
+  theme_bw()
+
+ar1_result6 <- result6$summary.random$nyeargroup |> 
+  left_join(plz2_db |> dplyr::select(nyeargroup, yeargroup) |> distinct(), by = c("ID" = "nyeargroup")) |> 
+  rename(lb = `0.025quant`, ub = `0.975quant`)
+
+ar1_result6 |> 
+  ggplot(aes(x = yeargroup, color = yeargroup)) +
+  geom_errorbar(aes(ymin = exp(lb), ymax = exp(ub)), show.legend = FALSE) +
+  geom_point(aes(y = exp(mean)), show.legend = FALSE) +
+  theme_bw() +
+  labs(x = "", y = "Effect")
+
+structured_result6 <- bym_st_result6 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects", fill = "Effect") +
+  theme_void()
+
+unstructured_result6 <- bym_st_result6 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects", fill = "Effect") +
+  theme_void()
+
+plot_grid(structured_result6, unstructured_result6, ncol = 2)
+```
+
+## RW2 vaccine coverage + iid area
+
+```{r}
+f7 <- cases_19F ~ 1 + f(idarea, model = "iid") + f(nyeargroup, model = "rw2") + f(vacc_cat, model = "rw2", constr = FALSE, extraconstr = extraconstr)
+
+result7 <- inla(
+  f7, 
+  family = "binomial",
+  data = data_inla_plz2, 
+  Ntrials = data_inla_plz2$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+```
+
+```{r}
+summary(result7)
+
+iidarea_result7 <- ger_shp_plz |>
+  mutate(idarea = row_number()) |> 
+  right_join(ger_ipd_plz2, by = c("plz" = "plz_2")) |> 
+  left_join(result7$summary.random$idarea, by = c("idarea" = "ID"))
+
+vacc_result7 <- result7$summary.random$vacc_cat
+
+vacc_result7 |> 
+  ggplot(aes(x = ID)) +
+  geom_errorbar(aes(ymin = exp(`0.025quant`), ymax = exp(`0.975quant`))) +
+  geom_point(aes(y = exp(mean))) +
+  labs(x = "Vaccine coverage", y = "Effect") +
+  scale_x_continuous(n.breaks = 6) +
+  theme_bw()
+
+ar1_result7 <- result7$summary.random$nyeargroup |> 
+  left_join(plz2_db |> dplyr::select(nyeargroup, yeargroup) |> distinct(), by = c("ID" = "nyeargroup")) |> 
+  rename(lb = `0.025quant`, ub = `0.975quant`)
+
+ar1_result7 |> 
+  ggplot(aes(x = yeargroup, color = yeargroup)) +
+  geom_errorbar(aes(ymin = exp(lb), ymax = exp(ub)), show.legend = FALSE) +
+  geom_point(aes(y = exp(mean)), show.legend = FALSE) +
+  theme_bw() +
+  labs(x = "", y = "Effect")
+
+iidarea_result7 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Spatial effect\n(iid)", fill = "Effect") +
+  theme_void()
+```
+
+## RW2 vaccine coverage without spatial term
+
+```{r}
+f8 <- cases_19F ~ 1 + f(nyeargroup, model = "rw2") + f(vacc_cat, model = "rw2", constr = FALSE, extraconstr = extraconstr)
+
+result8 <- inla(
+  f8, 
+  family = "binomial",
+  data = data_inla_plz2, 
+  Ntrials = data_inla_plz2$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+```
+
+```{r}
+summary(result8)
+
+vacc_result8 <- result8$summary.random$vacc_cat
+
+vacc_result8 |> 
+  ggplot(aes(x = ID)) +
+  geom_errorbar(aes(ymin = exp(`0.025quant`), ymax = exp(`0.975quant`))) +
+  geom_point(aes(y = exp(mean))) +
+  labs(x = "Vaccine coverage", y = "Effect") +
+  scale_x_continuous(n.breaks = 6) +
+  theme_bw()
+
+ar1_result8 <- result8$summary.random$nyeargroup |> 
+  left_join(plz2_db |> dplyr::select(nyeargroup, yeargroup) |> distinct(), by = c("ID" = "nyeargroup")) |> 
+  rename(lb = `0.025quant`, ub = `0.975quant`)
+
+ar1_result8 |> 
+  ggplot(aes(x = yeargroup, color = yeargroup)) +
+  geom_errorbar(aes(ymin = exp(lb), ymax = exp(ub)), show.legend = FALSE) +
+  geom_point(aes(y = exp(mean)), show.legend = FALSE) +
+  theme_bw() +
+  labs(x = "", y = "Effect")
+```
+
+## Gather WAIC/DICs
+
+```{r}
+mods <- list(result1, result2, result3, result4, result5, result6, result7, result8)
+form <- list(f1, f2, f3, f4, f5, f6, f7, f8)
+
+mod_comp <- data.frame(formula = sapply(form, function(f) paste(deparse(f, width.cutoff = 100), collapse = " ")),
+                       waic = sapply(mods, function(res) res$waic$waic),
+                       dic = sapply(mods, function(res) res$dic$dic)) |> 
+  mutate(waic_delta = waic - waic[1],
+         dic_delta = dic - dic[1])
+```
+
+## Using delta from yearly mean coverage
+
+```{r}
+plz2_db_delta <- plz2_db |> 
+  group_by(yeargroup) |> 
+  mutate(meancov = mean(vacc_rate, na.rm = TRUE)) |> 
+  ungroup() |> 
+  mutate(vacc_rate_d = vacc_rate - meancov,
+         vacc_cat_d = inla.group(vacc_rate_d, n = 10, method = "quantile"))
+
+data_inla_plz2_delta <- list(
+  cases_19F = plz2_db_delta$ipd_st,
+  total_cases = plz2_db_delta$ipd,
+  N = plz2_db_delta$ipd,
+  idarea = plz2_db_delta$idarea,
+  vacc_rate = plz2_db_delta$vacc_rate/100,
+  vacc_cat = plz2_db_delta$vacc_cat/100,
+  nyeargroup = plz2_db_delta$nyeargroup,
+  yeargroup = plz2_db_delta$yeargroup,
+  vacc_rate_d = plz2_db_delta$vacc_rate_d/100,
+  vacc_cat_d = plz2_db_delta$vacc_cat_d/100
+)
+```
+
+## Linear vaccine coverage delta
+
+```{r}
+f9 <- cases_19F ~ 1 + f(idarea, model = "bym2", graph = g_plz2) + yeargroup + vacc_rate_d
+
+result9 <- inla(
+  f9, 
+  family = "binomial",
+  data = data_inla_plz2_delta, 
+  Ntrials = data_inla_plz2_delta$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+```
+
+```{r}
+summary(result9)
+exp(result9$summary.fixed)
+
+bym_st_result9 <- ger_shp_plz |> 
+  cbind(result9$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_result9 <- ger_shp_plz |> 
+  cbind(result9$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+ar1_result9 <- result9$summary.random$nyeargroup |> 
+  left_join(plz2_db |> dplyr::select(nyeargroup, yeargroup) |> distinct(), by = c("ID" = "nyeargroup")) |> 
+  rename(lb = `0.025quant`, ub = `0.975quant`)
+
+ar1_result9 |> 
+  ggplot(aes(x = yeargroup, color = yeargroup)) +
+  geom_errorbar(aes(ymin = exp(lb), ymax = exp(ub)), show.legend = FALSE) +
+  geom_point(aes(y = exp(mean)), show.legend = FALSE) +
+  theme_bw() +
+  labs(x = "", y = "Effect")
+
+structured_result9 <- bym_st_result9 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects", fill = "Effect") +
+  theme_void()
+
+unstructured_result9 <- bym_st_result9 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects", fill = "Effect") +
+  theme_void()
+
+plot_grid(structured_result9, unstructured_result9, ncol = 2)
+```
+
+## RW2 vaccine coverage delta
+
+```{r}
+extraconstr2 <- list(
+  A = matrix(0, nrow = 1, ncol = length(unique((plz2_db_delta$vacc_cat_d)))),
+  e = 0
+)
+
+extraconstr2$A[1, 1] <- 1
+
+f10 <- cases_19F ~ 1 + f(idarea, model = "bym2", graph = g_plz2) + f(nyeargroup, model = "rw2") + f(vacc_cat_d, model = "rw2", constr = FALSE, extraconstr = extraconstr2)
+
+result10 <- inla(
+  f10, 
+  family = "binomial",
+  data = data_inla_plz2_delta, 
+  Ntrials = data_inla_plz2_delta$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+```
+
+```{r}
+summary(result10)
+
+bym_st_result10 <- ger_shp_plz |> 
+  cbind(result10$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_result10 <- ger_shp_plz |> 
+  cbind(result10$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+vacc_result10 <- result10$summary.random$vacc_cat
+
+vacc_result10 |> 
+  ggplot(aes(x = ID)) +
+  geom_errorbar(aes(ymin = exp(`0.025quant`), ymax = exp(`0.975quant`))) +
+  geom_point(aes(y = exp(mean))) +
+  labs(x = "Vaccine coverage (delta from mean)", y = "Effect") +
+  scale_x_continuous(n.breaks = 6) +
+  scale_y_continuous(breaks = c(0.5, 0.75, 1, 1.25, 1.5)) +
+  theme_bw()
+
+ar1_result10 <- result10$summary.random$nyeargroup |> 
+  left_join(plz2_db |> dplyr::select(nyeargroup, yeargroup) |> distinct(), by = c("ID" = "nyeargroup")) |> 
+  rename(lb = `0.025quant`, ub = `0.975quant`)
+
+ar1_result10 |> 
+  ggplot(aes(x = yeargroup, color = yeargroup)) +
+  geom_errorbar(aes(ymin = exp(lb), ymax = exp(ub)), show.legend = FALSE) +
+  geom_point(aes(y = exp(mean)), show.legend = FALSE) +
+  theme_bw() +
+  labs(x = "", y = "Effect")
+
+structured_result10 <- bym_st_result10 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects", fill = "Effect") +
+  theme_void()
+
+unstructured_result10 <- bym_st_result10 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects", fill = "Effect") +
+  theme_void()
+
+plot_grid(structured_result10, unstructured_result10, ncol = 2)
+```
+
+## Separated by period
+
+```{r}
+plz2_db_delta1 <- plz2_db |> 
+  group_by(yeargroup) |> 
+  mutate(meancov = mean(vacc_rate, na.rm = TRUE)) |> 
+  ungroup() |> 
+  mutate(vacc_rate_d = vacc_rate - meancov,
+         vacc_cat_d = inla.group(vacc_rate_d, n = 10, method = "quantile")) |> 
+  filter(nyeargroup == 1)
+
+plz2_db_delta2 <- plz2_db |> 
+  group_by(yeargroup) |> 
+  mutate(meancov = mean(vacc_rate, na.rm = TRUE)) |> 
+  ungroup() |> 
+  mutate(vacc_rate_d = vacc_rate - meancov,
+         vacc_cat_d = inla.group(vacc_rate_d, n = 10, method = "quantile")) |> 
+  filter(nyeargroup == 2)
+
+plz2_db_delta3 <- plz2_db |> 
+  group_by(yeargroup) |> 
+  mutate(meancov = mean(vacc_rate, na.rm = TRUE)) |> 
+  ungroup() |> 
+  mutate(vacc_rate_d = vacc_rate - meancov,
+         vacc_cat_d = inla.group(vacc_rate_d, n = 10, method = "quantile")) |> 
+  filter(nyeargroup == 3)
+
+data_inla_plz2_delta1 <- list(
+  cases_19F = plz2_db_delta1$ipd_st,
+  total_cases = plz2_db_delta1$ipd,
+  N = plz2_db_delta1$ipd,
+  idarea = plz2_db_delta1$idarea,
+  vacc_rate = plz2_db_delta1$vacc_rate/100,
+  vacc_cat = plz2_db_delta1$vacc_cat/100,
+  nyeargroup = plz2_db_delta1$nyeargroup,
+  yeargroup = plz2_db_delta1$yeargroup,
+  vacc_rate_d = plz2_db_delta1$vacc_rate_d/100,
+  vacc_cat_d = plz2_db_delta1$vacc_cat_d/100
+)
+
+data_inla_plz2_delta2 <- list(
+  cases_19F = plz2_db_delta2$ipd_st,
+  total_cases = plz2_db_delta2$ipd,
+  N = plz2_db_delta2$ipd,
+  idarea = plz2_db_delta2$idarea,
+  vacc_rate = plz2_db_delta2$vacc_rate/100,
+  vacc_cat = plz2_db_delta2$vacc_cat/100,
+  nyeargroup = plz2_db_delta2$nyeargroup,
+  yeargroup = plz2_db_delta2$yeargroup,
+  vacc_rate_d = plz2_db_delta2$vacc_rate_d/100,
+  vacc_cat_d = plz2_db_delta2$vacc_cat_d/100
+)
+
+data_inla_plz2_delta3 <- list(
+  cases_19F = plz2_db_delta3$ipd_st,
+  total_cases = plz2_db_delta3$ipd,
+  N = plz2_db_delta3$ipd,
+  idarea = plz2_db_delta3$idarea,
+  vacc_rate = plz2_db_delta3$vacc_rate/100,
+  vacc_cat = plz2_db_delta3$vacc_cat/100,
+  nyeargroup = plz2_db_delta3$nyeargroup,
+  yeargroup = plz2_db_delta3$yeargroup,
+  vacc_rate_d = plz2_db_delta3$vacc_rate_d/100,
+  vacc_cat_d = plz2_db_delta3$vacc_cat_d/100
+)
+```
+
+## Linear vaccine coverage delta
+
+```{r}
+f11 <- cases_19F ~ 1 + f(idarea, model = "bym2", graph = g_plz2) + vacc_rate_d
+
+result11 <- inla(
+  f11, 
+  family = "binomial",
+  data = data_inla_plz2_delta1, 
+  Ntrials = data_inla_plz2_delta1$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+
+result12 <- inla(
+  f11, 
+  family = "binomial",
+  data = data_inla_plz2_delta2, 
+  Ntrials = data_inla_plz2_delta2$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+
+result13 <- inla(
+  f11, 
+  family = "binomial",
+  data = data_inla_plz2_delta3, 
+  Ntrials = data_inla_plz2_delta3$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+```
+
+```{r}
+summary(result11)
+summary(result12)
+summary(result13)
+
+exp(result11$summary.fixed)
+exp(result12$summary.fixed)
+exp(result13$summary.fixed)
+```
+
+## Check other vaccines
+
+```{r}
+check <- ger_cov |> 
+  distinct(vaccine, age_group, vaccination_status)
+
+ger_dpt <- ger_cov |> 
+  filter(vaccine == "Diphtherie, Tetanus, Pertussis") |> 
+  left_join(plz_ags_key, by = c("county_ags" = "CC_2")) |> 
+  filter(!is.na(plz)) |> 
+  mutate(new_pop = pop_weight*overlap_percentage,
+         vaxed = new_pop*(vacc_rate/100),
+         year = year_birth+2,
+         nyeargroup = cut(year, breaks = c(2008, 2012, 2017, 2022), include.lowest = TRUE, labels = FALSE)) |> 
+  group_by(plz, nyeargroup, vaccination_status) |> 
+  summarise(dpt_vax_pop = as.numeric(sum(vaxed, na.rm = TRUE)),
+            dpt_all_pop = as.numeric(sum(new_pop, na.rm = TRUE))) |> 
+  ungroup() |> 
+  mutate(dpt_vacc_rate = dpt_vax_pop/dpt_all_pop*100,
+         dpt_vacc_cat = inla.group(dpt_vacc_rate, n = 10, method = "quantile"))
+
+ger_dpt_plz2 <- ger_ipd_plz2 |> 
+  left_join(ger_dpt, by = c("plz_2" = "plz", "nyeargroup"))
+
+ger_dpt_plz2_sf <- ger_shp_plz |> 
+  right_join(ger_dpt_plz2, by = c("plz" = "plz_2")) |> 
+  mutate(plz = factor(plz))
+
+ger_dpt_plz2_sf |> 
+  ggplot() +
+  geom_sf(data = ger_shp_plz, fill = "lightgray", color = NA) +
+  geom_sf(aes(fill = dpt_vacc_rate), color = NA) +
+  scale_fill_viridis_c(option = "C") +
+  facet_wrap(vaccination_status~yeargroup) +
+  labs(fill = "DPT vaccination coverage at 15 months") +
+  theme_void()
+
+ger_dpt_plz2_sf |> 
+  ungroup() |> 
+  filter(vaccination_status == "3. Dosis") |> 
+  mutate(dpt_vs_ipd = dpt_vacc_rate - vacc_rate) |> 
+  ggplot() +
+  geom_sf(data = ger_shp_plz, fill = "lightgray", color = NA) +
+  geom_sf(aes(fill = dpt_vs_ipd), color = NA) +
+  scale_fill_viridis_c(option = "C") +
+  facet_wrap(~yeargroup) +
+  labs(fill = "DPT 3 dose cov - PCV cov") +
+  theme_void()
+
+ger_dpt_plz2_sf |> 
+  ungroup() |> 
+  filter(vaccination_status == "3. Dosis") |> 
+  mutate(dpt_vs_ipd = dpt_vacc_rate - vacc_rate) |> 
+  ggplot(aes(x = dpt_vs_ipd)) +
+  geom_histogram()
+```
+
+```{r, fig.width = 11}
+gua1 <- ger_cov |> 
+  filter(vaccine == "Diphtherie, Tetanus, Pertussis") |> 
+  left_join(plz_ags_key, by = c("county_ags" = "CC_2")) |> 
+  filter(!is.na(plz)) |> 
+  pivot_wider(names_from = vaccination_status, values_from = vacc_rate) |> 
+  mutate(new_pop = pop_weight*overlap_percentage,
+         vaxed_1d = new_pop*(`1. Dosis`/100),
+         vaxed_3d = new_pop*(`3. Dosis`/100),
+         year = year_birth+2,
+         nyeargroup = cut(year, breaks = c(2008, 2012, 2017, 2022), include.lowest = TRUE, labels = FALSE)) |> 
+  group_by(plz, nyeargroup) |> 
+  summarise(dpt_vax1d_pop = as.numeric(sum(vaxed_1d, na.rm = TRUE)),
+            dpt_vax3d_pop = as.numeric(sum(vaxed_3d, na.rm = TRUE)),
+            dpt_all_pop = as.numeric(sum(new_pop, na.rm = TRUE))) |> 
+  ungroup() |> 
+  mutate(dpt_vacc_rate1d = dpt_vax1d_pop/dpt_all_pop*100,
+         dpt_vacc_rate3d = dpt_vax3d_pop/dpt_all_pop*100,
+         dpt_vacc_cat1d = inla.group(dpt_vacc_rate1d, n = 10, method = "quantile"),
+         dpt_vacc_cat3d = inla.group(dpt_vacc_rate3d, n = 10, method = "quantile"),
+         dpt_vacc_cat1dv2 = inla.group(dpt_vacc_rate1d, n = 5, method = "quantile"))
+
+gua2 <- ger_ipd_plz2 |> 
+  left_join(gua1, by = c("plz_2" = "plz", "nyeargroup")) |> 
+  mutate(delta = dpt_vacc_rate3d - dpt_vacc_rate1d)
+
+gua_sf <- ger_shp_plz |> 
+  right_join(gua2, by = c("plz" = "plz_2")) |> 
+  mutate(plz = factor(plz))
+
+gua_sf |> 
+  ggplot() +
+  geom_sf(data = ger_shp_plz, fill = "lightgray", color = NA) +
+  geom_sf(aes(fill = delta), color = NA) +
+  scale_fill_viridis_c(option = "C") +
+  facet_wrap(~yeargroup) +
+  labs(fill = "3 dose cov - 1 dose cov\n(DPT at 15m)") +
+  theme_void()
+```
+
+## RW2 using 1 dose DPT
+
+```{r}
+plz2_db_dpt <- ger_shp_plz |> 
+  st_drop_geometry() |> 
+  ungroup() |> 
+  mutate(idarea = row_number()) |> 
+  right_join(gua2, by = c("plz" = "plz_2"))
+
+data_inla_plz2_dpt <- list(
+  cases_19F = plz2_db_dpt$ipd_st,
+  total_cases = plz2_db_dpt$ipd,
+  N = plz2_db_dpt$ipd,
+  idarea = plz2_db_dpt$idarea,
+  vacc_rate = plz2_db_dpt$vacc_rate,
+  vacc_cat = plz2_db_dpt$vacc_cat,
+  nyeargroup = plz2_db_dpt$nyeargroup,
+  dpt1d = plz2_db_dpt$dpt_vacc_rate1d/100,
+  dpt1d_cat = plz2_db_dpt$dpt_vacc_cat1d/100,
+  dpt1d_cat2 = plz2_db_dpt$dpt_vacc_cat1dv2/100
+)
+
+extraconstr3 <- list(
+  A = matrix(0, nrow = 1, ncol = length(unique((data_inla_plz2_dpt$dpt1d_cat)))),
+  e = 0
+)
+
+extraconstr3$A[1, 1] <- 1
+
+extraconstr4 <- list(
+  A = matrix(0, nrow = 1, ncol = length(unique((data_inla_plz2_dpt$dpt1d_cat2)))),
+  e = 0
+)
+
+extraconstr4$A[1, 1] <- 1
+
+f11 <- cases_19F ~ 1 + f(idarea, model = "bym2", graph = g_plz2) + f(nyeargroup, model = "rw2") + dpt1d
+f12 <- cases_19F ~ 1 + f(idarea, model = "bym2", graph = g_plz2) + f(nyeargroup, model = "rw2") + f(dpt1d_cat, model = "rw2", constr = FALSE, extraconstr = extraconstr3)
+f13 <- cases_19F ~ 1 + f(idarea, model = "bym2", graph = g_plz2) + f(nyeargroup, model = "rw2") + f(dpt1d_cat2, model = "rw2", constr = FALSE, extraconstr = extraconstr4)
+
+result11 <- inla(
+  f11, 
+  family = "binomial",
+  data = data_inla_plz2_dpt, 
+  Ntrials = data_inla_plz2_dpt$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+
+result12 <- inla(
+  f12, 
+  family = "binomial",
+  data = data_inla_plz2_dpt, 
+  Ntrials = data_inla_plz2_dpt$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+
+result13 <- inla(
+  f13, 
+  family = "binomial",
+  data = data_inla_plz2_dpt, 
+  Ntrials = data_inla_plz2_dpt$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+```
+
+```{r}
+summary(result11)
+
+bym_st_result11 <- ger_shp_plz |> 
+  cbind(result11$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_result11 <- ger_shp_plz |> 
+  cbind(result11$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+ar1_result11 <- result11$summary.random$nyeargroup |> 
+  left_join(plz2_db_dpt |> dplyr::select(nyeargroup, yeargroup) |> distinct(), by = c("ID" = "nyeargroup")) |> 
+  rename(lb = `0.025quant`, ub = `0.975quant`)
+
+ar1_result11 |> 
+  ggplot(aes(x = yeargroup, color = yeargroup)) +
+  geom_errorbar(aes(ymin = exp(lb), ymax = exp(ub)), show.legend = FALSE) +
+  geom_point(aes(y = exp(mean)), show.legend = FALSE) +
+  theme_bw() +
+  labs(x = "", y = "Effect")
+
+structured_result11 <- bym_st_result11 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects", fill = "Effect") +
+  theme_void()
+
+unstructured_result11 <- bym_st_result11 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects", fill = "Effect") +
+  theme_void()
+
+plot_grid(structured_result11, unstructured_result11, ncol = 2)
+```
+
+```{r}
+summary(result12)
+
+bym_st_result12 <- ger_shp_plz |> 
+  cbind(result12$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_result12 <- ger_shp_plz |> 
+  cbind(result12$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+vacc_result12 <- result12$summary.random$dpt1d_cat
+
+vacc_result12 |> 
+  ggplot(aes(x = ID)) +
+  geom_errorbar(aes(ymin = exp(`0.025quant`), ymax = exp(`0.975quant`))) +
+  geom_point(aes(y = exp(mean))) +
+  labs(x = "Vaccine coverage - 1 dose DPT at 15m", y = "Effect") +
+  scale_x_continuous(n.breaks = 6) +
+  scale_y_continuous(breaks = c(0.5, 0.75, 1, 1.25, 1.5)) +
+  theme_bw()
+
+ar1_result12 <- result12$summary.random$nyeargroup |> 
+  left_join(plz2_db_dpt |> dplyr::select(nyeargroup, yeargroup) |> distinct(), by = c("ID" = "nyeargroup")) |> 
+  rename(lb = `0.025quant`, ub = `0.975quant`)
+
+ar1_result12 |> 
+  ggplot(aes(x = yeargroup, color = yeargroup)) +
+  geom_errorbar(aes(ymin = exp(lb), ymax = exp(ub)), show.legend = FALSE) +
+  geom_point(aes(y = exp(mean)), show.legend = FALSE) +
+  theme_bw() +
+  labs(x = "", y = "Effect")
+
+structured_result12 <- bym_st_result12 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects", fill = "Effect") +
+  theme_void()
+
+unstructured_result12 <- bym_st_result12 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects", fill = "Effect") +
+  theme_void()
+
+plot_grid(structured_result12, unstructured_result12, ncol = 2)
+```
+
+```{r}
+summary(result13)
+
+bym_st_result13 <- ger_shp_plz |> 
+  cbind(result13$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_result13 <- ger_shp_plz |> 
+  cbind(result13$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+vacc_result13 <- result13$summary.random$dpt1d_cat
+
+vacc_result13 |> 
+  ggplot(aes(x = ID)) +
+  geom_errorbar(aes(ymin = exp(`0.025quant`), ymax = exp(`0.975quant`))) +
+  geom_point(aes(y = exp(mean))) +
+  labs(x = "Vaccine coverage - 1 dose DPT at 15m", y = "Effect") +
+  scale_x_continuous(n.breaks = 6) +
+  scale_y_continuous(breaks = c(0.5, 0.75, 1, 1.25, 1.5)) +
+  theme_bw()
+
+ar1_result13 <- result13$summary.random$nyeargroup |> 
+  left_join(plz2_db_dpt |> dplyr::select(nyeargroup, yeargroup) |> distinct(), by = c("ID" = "nyeargroup")) |> 
+  rename(lb = `0.025quant`, ub = `0.975quant`)
+
+ar1_result13 |> 
+  ggplot(aes(x = yeargroup, color = yeargroup)) +
+  geom_errorbar(aes(ymin = exp(lb), ymax = exp(ub)), show.legend = FALSE) +
+  geom_point(aes(y = exp(mean)), show.legend = FALSE) +
+  theme_bw() +
+  labs(x = "", y = "Effect")
+
+structured_result13 <- bym_st_result13 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects", fill = "Effect") +
+  theme_void()
+
+unstructured_result13 <- bym_st_result13 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects", fill = "Effect") +
+  theme_void()
+
+plot_grid(structured_result13, unstructured_result13, ncol = 2)
+```
+
+```{r}
+mods2 <- list(result1, result11, result12, result13)
+form2 <- list(f1, f11, f12, f13)
+
+mod_comp2 <- data.frame(formula = sapply(form2, function(f) paste(deparse(f, width.cutoff = 100), collapse = " ")),
+                       waic = sapply(mods2, function(res) res$waic$waic),
+                       dic = sapply(mods2, function(res) res$dic$dic)) |> 
+  mutate(waic_delta = waic - waic[1],
+         dic_delta = dic - dic[1])
+```
+
+## Using 19A
+
+```{r}
+plz2_db3 <- ger_shp_plz |> 
+  st_drop_geometry() |> 
+  ungroup() |> 
+  mutate(idarea = row_number()) |> 
+  right_join(ger_ipd_19fa, by = c("plz" = "plz_2")) |> 
+  mutate(cat_19a = inla.group(ratio_19A, n = 10, method = "quantile"),
+         cat_19a2 = inla.group(ratio_19A, n = 5, method = "quantile")) |> 
+  filter(!is.na(cat_19a))
+
+data3 <- list(
+  cases_19F = plz2_db3$ipd_19F,
+  total_cases = plz2_db3$ipd,
+  N = plz2_db3$ipd,
+  idarea = plz2_db3$idarea,
+  vacc_rate = plz2_db3$vacc_rate,
+  vacc_cat = plz2_db3$vacc_cat,
+  nyeargroup = plz2_db3$nyeargroup,
+  ratio_19A = plz2_db3$ratio_19A,
+  ratio_19Acat = plz2_db3$cat_19a,
+  ratio_19Acat2 = plz2_db3$cat_19a2
+)
+```
+
+```{r}
+f14 <- cases_19F ~ 1 + f(idarea, model = "bym2", graph = g_plz2) + f(nyeargroup, model = "ar1") + ratio_19A
+
+result14 <- inla(
+  f14, 
+  family = "binomial",
+  data = data3, 
+  Ntrials = data3$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+
+summary(result14)
+
+exp(result14$summary.fixed)
+```
+
+```{r}
+extraconstr5 <- list(
+  A = matrix(0, nrow = 1, ncol = length(unique((plz2_db3$cat_19a)))),
+  e = 0
+)
+
+extraconstr5$A[1, 1] <- 1
+
+f15 <- cases_19F ~ 1 + f(idarea, model = "bym2", graph = g_plz2) + f(nyeargroup, model = "ar1") + f(ratio_19Acat, model = "rw2", constr = FALSE, extraconstr = extraconstr5)
+
+result15 <- inla(
+  f15, 
+  family = "binomial",
+  data = data3, 
+  Ntrials = data3$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+
+summary(result15)
+
+vacc_result15 <- result15$summary.random$ratio_19Acat
+
+vacc_result15 |> 
+  ggplot(aes(x = ID)) +
+  geom_errorbar(aes(ymin = exp(`0.025quant`), ymax = exp(`0.975quant`))) +
+  geom_point(aes(y = exp(mean))) +
+  labs(x = "19A proportion", y = "Effect") +
+  #scale_x_continuous(n.breaks = 6) +
+  scale_y_continuous(breaks = c(0.5, 0.75, 1, 1.25, 1.5)) +
+  theme_bw()
+
+bym_st_result15 <- ger_shp_plz |> 
+  cbind(result15$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_result15 <- ger_shp_plz |> 
+  cbind(result15$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+ar1_result15 <- result15$summary.random$nyeargroup |> 
+  left_join(plz2_db3 |> dplyr::select(nyeargroup, yeargroup) |> distinct(), by = c("ID" = "nyeargroup")) |> 
+  rename(lb = `0.025quant`, ub = `0.975quant`)
+
+ar1_result15 |> 
+  ggplot(aes(x = yeargroup, color = yeargroup)) +
+  geom_errorbar(aes(ymin = exp(lb), ymax = exp(ub)), show.legend = FALSE) +
+  geom_point(aes(y = exp(mean)), show.legend = FALSE) +
+  theme_bw() +
+  labs(x = "", y = "Effect")
+
+structured_result15 <- bym_st_result15 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects", fill = "Effect") +
+  theme_void()
+
+unstructured_result15 <- bym_st_result15 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects", fill = "Effect") +
+  theme_void()
+
+plot_grid(structured_result15, unstructured_result15, ncol = 2)
+```
+
+```{r}
+extraconstr6 <- list(
+  A = matrix(0, nrow = 1, ncol = length(unique((plz2_db3$cat_19a2)))),
+  e = 0
+)
+
+extraconstr6$A[1, 1] <- 1
+
+f16 <- cases_19F ~ 1 + f(idarea, model = "bym2", graph = g_plz2) + f(nyeargroup, model = "ar1") + f(ratio_19Acat2, model = "rw2", constr = FALSE, extraconstr = extraconstr6)
+
+result16 <- inla(
+  f16, 
+  family = "binomial",
+  data = data3, 
+  Ntrials = data3$N, 
+  control.predictor = list(compute = TRUE), 
+  control.compute = list(dic = TRUE, waic = TRUE),
+  verbose = TRUE
+)
+
+summary(result16)
+
+vacc_result16 <- result16$summary.random$ratio_19Acat2
+
+vacc_result16 |> 
+  ggplot(aes(x = ID)) +
+  geom_errorbar(aes(ymin = exp(`0.025quant`), ymax = exp(`0.975quant`))) +
+  geom_point(aes(y = exp(mean))) +
+  labs(x = "19A proportion", y = "Effect") +
+  #scale_x_continuous(n.breaks = 6) +
+  scale_y_continuous(breaks = c(0.5, 0.75, 1, 1.25, 1.5)) +
+  theme_bw()
+
+bym_st_result16 <- ger_shp_plz |> 
+  cbind(result16$summary.random$idarea[1:95, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+bym_unst_result16 <- ger_shp_plz |> 
+  cbind(result16$summary.random$idarea[96:190, ]) |> 
+  mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                         X0.025quant > 0 & X0.975quant < 0 ~ 1,
+                         .default = 0))
+
+ar1_result16 <- result16$summary.random$nyeargroup |> 
+  left_join(plz2_db3 |> dplyr::select(nyeargroup, yeargroup) |> distinct(), by = c("ID" = "nyeargroup")) |> 
+  rename(lb = `0.025quant`, ub = `0.975quant`)
+
+ar1_result16 |> 
+  ggplot(aes(x = yeargroup, color = yeargroup)) +
+  geom_errorbar(aes(ymin = exp(lb), ymax = exp(ub)), show.legend = FALSE) +
+  geom_point(aes(y = exp(mean)), show.legend = FALSE) +
+  theme_bw() +
+  labs(x = "", y = "Effect")
+
+structured_result16 <- bym_st_result16 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Structured effects", fill = "Effect") +
+  theme_void()
+
+unstructured_result16 <- bym_st_result16 |> 
+  ggplot() +
+  geom_sf(aes(fill = exp(mean)), color = NA) +
+  scale_fill_viridis_c() +
+  labs(title = "Unstructured effects", fill = "Effect") +
+  theme_void()
+
+plot_grid(structured_result16, unstructured_result16, ncol = 2)
+```
+
+## Scatterplot 19F vs vaccine
+
+```{r, fig.width = 11, fig.height = 5}
+ger_ipd_19fa |> 
+  ggplot() +
+  geom_point(aes(x = vacc_rate, y = ratio_19F, size = ipd), alpha = 0.5) +
+  labs(size = "Total IPD cases") +
+  facet_grid(~yeargroup, scales = "free_y") +
+  theme_bw() +
+  labs(x = "% vaccinated", y = "Proportion 19F cases") +
+  theme(text = element_text(size = 16),
+        legend.position = "none")
+
+ger_ipd_19fa |> 
+  ggplot() +
+  geom_point(aes(x = vacc_rate, y = ratio_19F, size = ipd), alpha = 0.5) +
+  geom_smooth(aes(x = vacc_rate, y = ratio_19F)) +
+  labs(size = "Total IPD cases") +
+  facet_grid(~yeargroup) +
+  theme_bw() +
+  labs(x = "% vaccinated", y = "Proportion 19F cases") +
+  theme(text = element_text(size = 16))
+
+ger_ipd_19fa |> 
+  ggplot() +
+  geom_point(aes(x = log(vacc_rate), y = log(ratio_19F), size = ipd), alpha = 0.5) +
+  labs(size = "Total IPD cases") +
+  facet_grid(~yeargroup) +
+  theme_bw() +
+  labs(x = "% vaccinated (log)", y = "Proportion 19F cases (log)") +
+  theme(text = element_text(size = 16))
+
+ger_ipd_19fa |> 
+  ggplot() +
+  geom_point(aes(x = log(vacc_rate), y = log(ratio_19F), size = ipd), alpha = 0.5) +
+  geom_smooth(aes(x = log(vacc_rate), y = log(ratio_19F))) +
+  labs(size = "Total IPD cases") +
+  facet_grid(~yeargroup) +
+  theme_bw() +
+  labs(x = "% vaccinated (log)", y = "Proportion 19F cases (log)") +
+  theme(text = element_text(size = 16))
+```
+
+
+## Scatterplot 19A vs 19F
+
+```{r}
+ger_ipd_19fa |> 
+  ggplot() +
+  geom_point(aes(x = ratio_19A, y = ratio_19F, size = ipd), alpha = 0.5) +
+  labs(size = "Total IPD cases") +
+  theme_bw()
+
+ger_ipd_19fa |> 
+  ggplot() +
+  geom_point(aes(x = ratio_19A, y = ratio_19F, size = ipd), alpha = 0.5) +
+  geom_smooth(aes(x = ratio_19A, y = ratio_19F)) +
+  labs(size = "Total IPD cases") +
+  theme_bw()
+
+ger_ipd_19fa |> 
+  ggplot() +
+  geom_point(aes(x = log(ratio_19A), y = log(ratio_19F), size = ipd), alpha = 0.5) +
+  labs(size = "Total IPD cases") +
+  theme_bw()
+
+ger_ipd_19fa |> 
+  ggplot() +
+  geom_point(aes(x = log(ratio_19A), y = log(ratio_19F), size = ipd), alpha = 0.5) +
+  geom_smooth(aes(x = log(ratio_19A), y = log(ratio_19F))) +
+  labs(size = "Total IPD cases") +
+  theme_bw()
+```
+
+```{r, fig.width = 11, fig.height = 5}
+ger_ipd_19fa |> 
+  ggplot() +
+  geom_point(aes(x = ratio_19A, y = ratio_19F, size = ipd), alpha = 0.5) +
+  labs(size = "Total IPD cases") +
+  facet_grid(~yeargroup, scales = "free_y") +
+  theme_bw() +
+  labs(x = "Proportion 19A cases", y = "Proportion 19F cases") +
+  theme(text = element_text(size = 16))
+
+ger_ipd_19fa |> 
+  ggplot() +
+  geom_point(aes(x = ratio_19A, y = ratio_19F, size = ipd), alpha = 0.5) +
+  geom_smooth(aes(x = ratio_19A, y = ratio_19F)) +
+  labs(size = "Total IPD cases") +
+  facet_grid(~yeargroup) +
+  theme_bw() +
+  labs(x = "Proportion 19A cases", y = "Proportion 19F cases") +
+  theme(text = element_text(size = 16))
+
+ger_ipd_19fa |> 
+  ggplot() +
+  geom_point(aes(x = log(ratio_19A), y = log(ratio_19F), size = ipd), alpha = 0.5) +
+  labs(size = "Total IPD cases") +
+  facet_grid(~yeargroup) +
+  theme_bw() +
+  labs(x = "Proportion 19A cases (log)", y = "Proportion 19F cases (log)") +
+  theme(text = element_text(size = 16))
+
+ger_ipd_19fa |> 
+  ggplot() +
+  geom_point(aes(x = log(ratio_19A), y = log(ratio_19F), size = ipd), alpha = 0.5) +
+  geom_smooth(aes(x = log(ratio_19A), y = log(ratio_19F))) +
+  labs(size = "Total IPD cases") +
+  facet_grid(~yeargroup) +
+  theme_bw() +
+  labs(x = "Proportion 19A cases (log)", y = "Proportion 19F cases (log)") +
+  theme(text = element_text(size = 16))
+```
+

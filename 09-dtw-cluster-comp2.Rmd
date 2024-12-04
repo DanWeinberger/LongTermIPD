@@ -1,0 +1,2633 @@
+---
+title: "DTW Clustering"
+author: "Paloma Cárcamo"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, dtwclust, ggdendro, plotly, mgcv)
+```
+
+```{r, echo = FALSE}
+pcv7_st <- c("4","6B","9V","14","18C","19F","23F")
+pcv13_st <- c("1","3","4","5","6A","6B","7F","9V","14","18C","19A","19F","23F")
+pcv13_stlab <- c("1","3","5","6A","7F","19A")
+pcv15_st <- c("1","3","4","5","6A","6B","7F","9V","14","18C","19A","19F","22F","23F","33F")
+pcv20_st <- c("1","3","4","5","6A","6B","7F","8","9V","10A","11A","12F","14","15B","18C","19A","19F","22F","23F","33F")
+```
+
+## United States
+
+PCV-7 introduced in 2000; PCV-13 in 2010.
+
+```{r, echo = FALSE}
+us_raw <- read_rds("data/ABCs_st_1998_2021.rds")
+
+us <- us_raw |> 
+  rename(agec = "Age.Group..years.",
+         year = Year,
+         st = IPD.Serotype,
+         N_IPD = Frequency.Count)  |> 
+  mutate(st = if_else(st == '16', '16F', st))  |> 
+  group_by(st, year) |> 
+  summarize(N_IPD = sum(N_IPD))  |> 
+  ungroup() |> 
+  complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(st != "MISS" & st != "NT") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number(),
+         tot_cases = sum(N_IPD)) |> 
+  ungroup() |> 
+  filter(tot_cases > 50) |> 
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+
+us2 <- us_raw |> 
+  rename(agec = "Age.Group..years.",
+         year = Year,
+         st = IPD.Serotype,
+         N_IPD = Frequency.Count)  |> 
+  mutate(st = if_else(st == '16', '16F', st))  |> 
+  group_by(st, year) |> 
+  summarize(N_IPD = sum(N_IPD))  |> 
+  ungroup() |> 
+  complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(st != "MISS" & st != "NT") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number(),
+         tot_cases = sum(N_IPD)) |> 
+  ungroup() |> 
+  filter(tot_cases > 50) |> 
+  dplyr::select(st, N_IPD, year) |> 
+  nest(.by = "st") |> 
+  deframe()
+```
+
+### Smooth with p-splines
+
+```{r}
+gmods <- list()
+
+for (i in names(us)) {
+  gmods[[i]] <- tryCatch(
+    {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 25),
+                    family = poisson,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = us[[i]]),
+        success = 1
+      )
+    },
+    warning = function(w) {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 25),
+                    family = poisson,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = us[[i]]),
+        success = 0
+      )
+    }
+  )
+}
+
+smooth_us <- list()
+
+for (i in names(us)){
+  smooth_us[[i]] = data.frame(fitcases = gmods[[i]]$model$fitted.values) %>% 
+    dplyr::mutate(nyear = seq.int(from = 1, by = 1, length.out = n()),
+                  success = gmods[[i]]$success)
+}
+
+# smooth_us |>
+#   enframe() |>
+#   unnest(cols = c(value)) |>
+#   select(name, success) |>
+#   distinct() |>
+#   filter(success == 0)
+
+ts_us <- smooth_us |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+tslabels_us <- tibble(name = names(ts_us),
+                      group = 1:length(ts_us))
+
+# write_rds(ts_us, "data/interim/ts_us.rds")
+# write_rds(tslabels_us, "data/interim/tslabels_us.rds")
+```
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+us2 |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(year >= 2010) |> 
+  #left_join(smooth_us |> enframe() |> unnest(cols = c(value)) |> filter(success == 1), by = c("name", "nyear")) |> 
+  ggplot(aes(x = as.integer(year), y = N_IPD)) +
+  geom_vline(aes(xintercept = 2010, color = "PCV13 introduced"), lty = 2) +
+  scale_color_manual(values = c("PCV13 introduced" = "red")) +
+  geom_line() +
+  #geom_line(aes(y = fitcases), color = "red") +
+  facet_wrap(~name, scales = "free_y") +
+  scale_x_continuous(breaks = c(2010, 2015, 2020)) +
+  labs(x = "", y = "IPD cases", color = "") +
+  theme_bw() +
+  theme(legend.position = "inside",
+        legend.position.inside = c(0.93,0.07))
+```
+
+### DTW clustering {.tabset}
+
+```{r, echo = FALSE}
+ts_us <- read_rds("data/interim/ts_us.rds")
+tslabels_us <- read_rds("data/interim/tslabels_us.rds")
+```
+
+#### raw, Z-score
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_us_raw <- us |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_us_raw <- tibble(name = names(ts_us_raw),
+                          group = 1:length(ts_us_raw))
+
+dtw_us2 <- dtwclust::tsclust(ts_us_raw,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_us2 <- as.data.frame((ggplot_build(plot(dtw_us2, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_us_raw, by = "group")
+
+hc_centroid_us2 <- as.data.frame((ggplot_build(plot(dtw_us2, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_us2 <- label(dendro_data(as.dendrogram(dtw_us2))) |> 
+  left_join(hc_members_us2 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_us2 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_us2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_us2, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+#### p-spline smoothed, Z-score
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+dtw_us1 <- dtwclust::tsclust(ts_us,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_us1 <- as.data.frame((ggplot_build(plot(dtw_us1, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_us, by = "group")
+
+hc_centroid_us1 <- as.data.frame((ggplot_build(plot(dtw_us1, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_us1 <- label(dendro_data(as.dendrogram(dtw_us1))) |> 
+  left_join(hc_members_us1 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_us1 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_us1) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_us1, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+#### raw, log-transformed
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_us_rawlog <- us |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  mutate(N_IPD = log(N_IPD+1)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_us_rawlog <- tibble(name = names(ts_us_rawlog),
+                          group = 1:length(ts_us_rawlog))
+
+dtw_us3 <- dtwclust::tsclust(ts_us_rawlog,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = NULL,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_us3 <- as.data.frame((ggplot_build(plot(dtw_us3, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_us_rawlog, by = "group")
+
+hc_centroid_us3 <- as.data.frame((ggplot_build(plot(dtw_us3, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_us3 <- label(dendro_data(as.dendrogram(dtw_us3))) |> 
+  left_join(hc_members_us3 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_us3 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_us3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_us3, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+#### p-spline smoothed, log-transformed
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_us2 <- smooth_us |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  mutate(fitcases = log(fitcases+1)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+dtw_us4 <- dtwclust::tsclust(ts_us2,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = NULL,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_us4 <- as.data.frame((ggplot_build(plot(dtw_us4, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_us, by = "group")
+
+hc_centroid_us4 <- as.data.frame((ggplot_build(plot(dtw_us4, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_us4 <- label(dendro_data(as.dendrogram(dtw_us4))) |> 
+  left_join(hc_members_us4 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_us4 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_us4) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_us4, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+#### p-spline smoothed, Z and log-transformed
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+dtw_us5 <- dtwclust::tsclust(ts_us2,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_us5 <- as.data.frame((ggplot_build(plot(dtw_us5, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_us, by = "group")
+
+hc_centroid_us5 <- as.data.frame((ggplot_build(plot(dtw_us5, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_us5 <- label(dendro_data(as.dendrogram(dtw_us5))) |> 
+  left_join(hc_members_us5 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_us5 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_us5) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_us5, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+## United States - from 2010
+
+PCV-7 introduced in 2000; PCV-13 in 2010.
+
+```{r, echo = FALSE}
+us_cut <- us_raw |> 
+  rename(agec = "Age.Group..years.",
+         year = Year,
+         st = IPD.Serotype,
+         N_IPD = Frequency.Count)  |> 
+  mutate(st = if_else(st == '16', '16F', st))  |> 
+  filter(year >= 2010) |> 
+  group_by(st, year) |> 
+  summarize(N_IPD = sum(N_IPD))  |> 
+  ungroup() |> 
+  complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(st != "MISS" & st != "NT") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number(),
+         tot_cases = sum(N_IPD)) |> 
+  ungroup() |> 
+  filter(tot_cases > 50) |> 
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+```
+
+### Smooth with p-splines
+
+```{r}
+gmods_us_cut <- list()
+
+for (i in names(us_cut)) {
+  gmods_us_cut[[i]] <- tryCatch(
+    {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 13),
+                    family = poisson,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = us_cut[[i]]),
+        success = 1
+      )
+    },
+    warning = function(w) {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 13),
+                    family = poisson,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = us_cut[[i]]),
+        success = 0
+      )
+    }
+  )
+}
+
+smooth_us_cut <- list()
+
+for (i in names(us_cut)){
+  smooth_us_cut[[i]] = data.frame(fitcases = gmods_us_cut[[i]]$model$fitted.values) %>% 
+    dplyr::mutate(nyear = seq.int(from = 1, by = 1, length.out = n()),
+                  success = gmods_us_cut[[i]]$success)
+}
+
+# smooth_us_cut |>
+#   enframe() |>
+#   unnest(cols = c(value)) |>
+#   select(name, success) |>
+#   distinct() |>
+#   filter(success == 0)
+
+ts_us_cut <- smooth_us_cut |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+tslabels_us_cut <- tibble(name = names(ts_us_cut),
+                      group = 1:length(ts_us_cut))
+
+# write_rds(ts_us_cut, "data/interim/ts_us_cut.rds")
+# write_rds(tslabels_us_cut, "data/interim/tslabels_us_cut.rds")
+```
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+us_cut |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  left_join(smooth_us_cut |> enframe() |> unnest(cols = c(value)) |> filter(success == 1), by = c("name", "nyear")) |> 
+  ggplot(aes(x = nyear, y = N_IPD)) +
+  geom_line() +
+  geom_line(aes(y = fitcases), color = "red") +
+  facet_wrap(~name, scales = "free_y") +
+  theme_bw()
+```
+
+### DTW clustering {.tabset}
+
+```{r, echo = FALSE}
+ts_us_cut <- read_rds("data/interim/ts_us_cut.rds")
+tslabels_us_cut <- read_rds("data/interim/tslabels_us_cut.rds")
+```
+
+#### raw, Z-score
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_us_cut_raw <- us_cut |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_us_cut_raw <- tibble(name = names(ts_us_cut_raw),
+                          group = 1:length(ts_us_cut_raw))
+
+dtw_us_cut2 <- dtwclust::tsclust(ts_us_cut_raw,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_us_cut2 <- as.data.frame((ggplot_build(plot(dtw_us_cut2, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_us_cut_raw, by = "group")
+
+hc_centroid_us_cut2 <- as.data.frame((ggplot_build(plot(dtw_us_cut2, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_us_cut2 <- label(dendro_data(as.dendrogram(dtw_us_cut2))) |> 
+  left_join(hc_members_us_cut2 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_us_cut2 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_us_cut2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_us_cut2, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+#### p-spline smoothed, Z-score
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+dtw_us_cut1 <- dtwclust::tsclust(ts_us_cut,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_us_cut1 <- as.data.frame((ggplot_build(plot(dtw_us_cut1, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_us_cut, by = "group")
+
+hc_centroid_us_cut1 <- as.data.frame((ggplot_build(plot(dtw_us_cut1, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_us_cut1 <- label(dendro_data(as.dendrogram(dtw_us_cut1))) |> 
+  left_join(hc_members_us_cut1 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_us_cut1 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_us_cut1) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_us_cut1, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+#### raw, log-transformed
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_us_cut_rawlog <- us |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  mutate(N_IPD = log(N_IPD+1)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_us_cut_rawlog <- tibble(name = names(ts_us_cut_rawlog),
+                          group = 1:length(ts_us_cut_rawlog))
+
+dtw_us_cut3 <- dtwclust::tsclust(ts_us_cut_rawlog,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = NULL,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_us_cut3 <- as.data.frame((ggplot_build(plot(dtw_us_cut3, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_us_cut_rawlog, by = "group")
+
+hc_centroid_us_cut3 <- as.data.frame((ggplot_build(plot(dtw_us_cut3, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_us_cut3 <- label(dendro_data(as.dendrogram(dtw_us_cut3))) |> 
+  left_join(hc_members_us_cut3 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_us_cut3 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_us_cut3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_us_cut3, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+#### p-spline smoothed, log-transformed
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_us_cut2 <- smooth_us_cut |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  mutate(fitcases = log(fitcases+1)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+dtw_us_cut4 <- dtwclust::tsclust(ts_us_cut2,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = NULL,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_us_cut4 <- as.data.frame((ggplot_build(plot(dtw_us_cut4, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_us_cut, by = "group")
+
+hc_centroid_us_cut4 <- as.data.frame((ggplot_build(plot(dtw_us_cut4, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_us_cut4 <- label(dendro_data(as.dendrogram(dtw_us_cut4))) |> 
+  left_join(hc_members_us_cut4 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_us_cut4 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_us_cut4) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_us_cut4, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+#### p-spline smoothed, Z and log-transformed
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+dtw_us_cut5 <- dtwclust::tsclust(ts_us_cut2,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_us_cut5 <- as.data.frame((ggplot_build(plot(dtw_us_cut5, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_us_cut, by = "group")
+
+hc_centroid_us_cut5 <- as.data.frame((ggplot_build(plot(dtw_us_cut5, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_us_cut5 <- label(dendro_data(as.dendrogram(dtw_us_cut5))) |> 
+  left_join(hc_members_us_cut5 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_us_cut5 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_us_cut5) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_us_cut5, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+## Australia
+
+PCV-7 introduced in 2005; PCV-13 in 2011.
+
+```{r, echo = FALSE}
+aus_raw <- readxl::read_xlsx("data/aus_ipd.xlsx", skip = 1)
+
+aus <- aus_raw |> 
+  rename(year = Year,
+         st = Serotype)  |> 
+  group_by(year, st) |> 
+  summarise(N_IPD = n()) |> 
+  ungroup() |> 
+  complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(!grepl("[ /]", st) & st != "UNTYPED") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number(),
+         tot_cases = sum(N_IPD)) |> 
+  ungroup() |> 
+  filter(tot_cases > 50) |>
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+
+aus2 <- aus_raw |> 
+  rename(year = Year,
+         st = Serotype)  |> 
+  group_by(year, st) |> 
+  summarise(N_IPD = n()) |> 
+  ungroup() |> 
+  complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(!grepl("[ /]", st) & st != "UNTYPED") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number(),
+         tot_cases = sum(N_IPD)) |> 
+  ungroup() |> 
+  filter(tot_cases > 50) |>
+  dplyr::select(st, N_IPD, year) |> 
+  nest(.by = "st") |> 
+  deframe()
+```
+
+### Smooth with p-splines
+
+```{r}
+gmods_aus <- list()
+
+for (i in names(aus)) {
+  gmods_aus[[i]] <- tryCatch(
+    {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 14),
+                    family = poisson,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = aus[[i]]),
+        success = 1
+      )
+    },
+    warning = function(w) {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 14),
+                    family = poisson,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = aus[[i]]),
+        success = 0
+      )
+    }
+  )
+}
+
+smooth_aus <- list()
+
+for (i in names(aus)){
+  smooth_aus[[i]] = data.frame(fitcases = gmods_aus[[i]]$model$fitted.values) %>% 
+    dplyr::mutate(nyear = seq.int(from = 1, by = 1, length.out = n()),
+                  success = gmods_aus[[i]]$success)
+}
+
+# smooth_aus |>
+#   enframe() |>
+#   unnest(cols = c(value)) |>
+#   select(name, success) |>
+#   distinct() |>
+#   filter(success == 0)
+
+ts_aus <- smooth_aus |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+tslabels_aus <- tibble(name = names(ts_aus),
+                      group = 1:length(ts_aus))
+
+# write_rds(ts_aus, "data/interim/ts_aus.rds")
+# write_rds(tslabels_aus, "data/interim/tslabels_aus.rds")
+```
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+aus2 |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  #left_join(smooth_aus |> enframe() |> unnest(cols = c(value)) |> filter(success == 1), by = c("name", "nyear")) |> 
+  ggplot(aes(x = as.integer(year), y = N_IPD)) +
+  geom_vline(aes(xintercept = 2011, color = "PCV13 introduced"), lty = 2) +
+  scale_color_manual(values = c("PCV13 introduced" = "red")) +
+  geom_line() +
+  #geom_line(aes(y = fitcases), color = "red") +
+  facet_wrap(~name, scales = "free_y") +
+  scale_x_continuous(breaks = c(2010, 2015, 2020)) +
+  labs(x = "", y = "IPD cases", color = "") +
+  theme_bw() +
+  theme(legend.position = "inside",
+        legend.position.inside = c(0.93,0.07))
+```
+
+### DTW clustering {.tabset}
+
+#### raw, Z-score
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_aus_raw <- aus |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_aus_raw <- tibble(name = names(ts_aus_raw),
+                          group = 1:length(ts_aus_raw))
+
+dtw_aus2 <- dtwclust::tsclust(ts_aus_raw,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_aus2 <- as.data.frame((ggplot_build(plot(dtw_aus2, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_aus_raw, by = "group")
+
+hc_centroid_aus2 <- as.data.frame((ggplot_build(plot(dtw_aus2, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_aus2 <- label(dendro_data(as.dendrogram(dtw_aus2))) |> 
+  left_join(hc_members_aus2 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_aus2 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_aus2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_aus2, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+#### p-spline smoothed, Z-score
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+dtw_aus1 <- dtwclust::tsclust(ts_aus,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_aus1 <- as.data.frame((ggplot_build(plot(dtw_aus1, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_aus, by = "group")
+
+hc_centroid_aus1 <- as.data.frame((ggplot_build(plot(dtw_aus1, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_aus1 <- label(dendro_data(as.dendrogram(dtw_aus1))) |> 
+  left_join(hc_members_aus1 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_aus1 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_aus1) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_aus1, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+#### raw, log-transformed
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_aus_rawlog <- aus |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  mutate(N_IPD = log(N_IPD+1)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_aus_rawlog <- tibble(name = names(ts_aus_rawlog),
+                          group = 1:length(ts_aus_rawlog))
+
+dtw_aus3 <- dtwclust::tsclust(ts_aus_rawlog,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = NULL,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_aus3 <- as.data.frame((ggplot_build(plot(dtw_aus3, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_aus_rawlog, by = "group")
+
+hc_centroid_aus3 <- as.data.frame((ggplot_build(plot(dtw_aus3, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_aus3 <- label(dendro_data(as.dendrogram(dtw_aus3))) |> 
+  left_join(hc_members_aus3 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_aus3 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_aus3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_aus3, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+#### p-spline smoothed, log-transformed
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_aus2 <- smooth_aus |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  mutate(fitcases = log(fitcases+1)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+dtw_aus4 <- dtwclust::tsclust(ts_aus2,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = NULL,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_aus4 <- as.data.frame((ggplot_build(plot(dtw_aus4, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_aus, by = "group")
+
+hc_centroid_aus4 <- as.data.frame((ggplot_build(plot(dtw_aus4, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_aus4 <- label(dendro_data(as.dendrogram(dtw_aus4))) |> 
+  left_join(hc_members_aus4 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_aus4 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_aus4) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_aus4, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+#### p-spline smoothed, Z and log-transformed
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+dtw_aus5 <- dtwclust::tsclust(ts_aus2,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_aus5 <- as.data.frame((ggplot_build(plot(dtw_aus5, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_aus, by = "group")
+
+hc_centroid_aus5 <- as.data.frame((ggplot_build(plot(dtw_aus5, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_aus5 <- label(dendro_data(as.dendrogram(dtw_aus5))) |> 
+  left_join(hc_members_aus5 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_aus5 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_aus5) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_aus5, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+## Europe
+
+```{r, echo = FALSE}
+eur_raw <- read_csv("data/ecdc_processed.csv", col_select = -1)
+
+eur <- eur_raw |> 
+  group_by(country, year, st) |> 
+  summarise(N_IPD = sum(N_cases, na.rm = TRUE)) |> 
+  ungroup()
+```
+
+```{r, fig.width = 12, fig.height = 7}
+eur |> 
+  ggplot(aes(x = year, y = N_IPD, color = country)) +
+  geom_line() +
+  facet_wrap(~st, scales = "free_y") +
+  theme_bw()
+
+eur |> 
+  ggplot(aes(x = year, y = N_IPD, color = st)) +
+  geom_line() +
+  facet_wrap(~country, scales = "free_y") +
+  theme_bw()
+```
+
+## United Kingdom
+
+PCV-7 in 2006 (before start of data), PCV-13 in 2010
+
+```{r, echo = FALSE}
+uk <- eur |> 
+  filter(country == "United Kingdom") |> 
+  select(-country) |> 
+  #complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(st != "NTYP") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number(),
+         tot_cases = sum(N_IPD),
+         numb_year = length(unique(nyear))) |> 
+  ungroup() |> 
+  filter(tot_cases > 50,
+         numb_year == 9) |>
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+
+uk2 <- eur |> 
+  filter(country == "United Kingdom") |> 
+  select(-country) |> 
+  #complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(st != "NTYP") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number(),
+         tot_cases = sum(N_IPD),
+         numb_year = length(unique(nyear))) |> 
+  ungroup() |> 
+  filter(tot_cases > 50,
+         numb_year == 9) |>
+  dplyr::select(st, N_IPD, year) |> 
+  nest(.by = "st") |> 
+  deframe()
+```
+
+### Smooth with p-splines
+
+```{r}
+gmods_uk <- list()
+
+for (i in names(uk)) {
+  gmods_uk[[i]] <- tryCatch(
+    {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, k = nrow(uk[[i]])),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = uk[[i]]),
+        success = 1
+      )
+    },
+    warning = function(w) {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, k = nrow(uk[[i]])),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = uk[[i]]),
+        success = 0
+      )
+    }
+  )
+}
+
+smooth_uk <- list()
+
+for (i in names(uk)){
+  smooth_uk[[i]] = data.frame(fitcases = gmods_uk[[i]]$model$fitted.values) %>% 
+    dplyr::mutate(nyear = seq.int(from = 1, by = 1, length.out = n()),
+                  success = gmods_uk[[i]]$success)
+}
+
+# smooth_uk |>
+#   enframe() |>
+#   unnest(cols = c(value)) |>
+#   select(name, success) |>
+#   distinct() |>
+#   filter(success == 0)
+
+# no gam convergence for 45, 46, 48
+
+ts_uk <- smooth_uk |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+tslabels_uk <- tibble(name = names(ts_uk),
+                      group = 1:length(ts_uk))
+
+# write_rds(ts_uk, "data/interim/ts_uk.rds")
+# write_rds(tslabels_uk, "data/interim/tslabels_uk.rds")
+```
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+uk2 |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(N_IPD != 0) |> 
+  #left_join(smooth_uk |> enframe() |> unnest(cols = c(value)) |> filter(success == 1), by = c("name", "nyear")) |> 
+  ggplot(aes(x = as.integer(year), y = N_IPD)) +
+  geom_vline(aes(xintercept = 2010, color = "PCV13 introduced"), lty = 2) +
+  scale_color_manual(values = c("PCV13 introduced" = "red")) +
+  geom_line() +
+  #geom_line(aes(y = fitcases), color = "red") +
+  facet_wrap(~name, scales = "free_y") +
+  scale_x_continuous(breaks = c(2010, 2015, 2020)) +
+  labs(x = "", y = "IPD cases", color = "") +
+  theme_bw() +
+  theme(legend.position = "inside",
+        legend.position.inside = c(0.93,0.07))
+```
+
+### DTW clustering {.tabset}
+
+#### raw, Z-score
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_uk_raw <- uk |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_uk_raw <- tibble(name = names(ts_uk_raw),
+                          group = 1:length(ts_uk_raw))
+
+dtw_uk2 <- dtwclust::tsclust(ts_uk_raw,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_uk2 <- as.data.frame((ggplot_build(plot(dtw_uk2, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_uk_raw, by = "group")
+
+hc_centroid_uk2 <- as.data.frame((ggplot_build(plot(dtw_uk2, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_uk2 <- label(dendro_data(as.dendrogram(dtw_uk2))) |> 
+  left_join(hc_members_uk2 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_uk2 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_uk2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "bottom") + 
+  geom_point(data = labs_uk2, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+#### raw, log-transformed
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_uk_rawlog <- uk |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  mutate(N_IPD = log(N_IPD+1)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_uk_rawlog <- tibble(name = names(ts_uk_rawlog),
+                          group = 1:length(ts_uk_rawlog))
+
+dtw_uk3 <- dtwclust::tsclust(ts_uk_rawlog,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = NULL,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_uk3 <- as.data.frame((ggplot_build(plot(dtw_uk3, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_uk_rawlog, by = "group")
+
+hc_centroid_uk3 <- as.data.frame((ggplot_build(plot(dtw_uk3, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_uk3 <- label(dendro_data(as.dendrogram(dtw_uk3))) |> 
+  left_join(hc_members_uk3 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_uk3 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_uk3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "bottom") + 
+  geom_point(data = labs_uk3, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+## France
+
+PCV-7 in 2003, PCV-13 in 2010
+
+```{r, echo = FALSE}
+fra <- eur |> 
+  filter(country == "France") |> 
+  select(-country) |> 
+  #complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(st != "NTYP") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number(),
+         tot_cases = sum(N_IPD),
+         numb_year = length(unique(nyear))) |> 
+  ungroup() |> 
+  filter(tot_cases > 50,
+         numb_year == 9) |>
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+```
+
+### Smooth with p-splines
+
+```{r}
+gmods_fra <- list()
+
+for (i in names(fra)) {
+  gmods_fra[[i]] <- tryCatch(
+    {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, k = nrow(fra[[i]])),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = fra[[i]]),
+        success = 1
+      )
+    },
+    warning = function(w) {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, k = nrow(fra[[i]])),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = fra[[i]]),
+        success = 0
+      )
+    }
+  )
+}
+
+smooth_fra <- list()
+
+for (i in names(fra)){
+  smooth_fra[[i]] = data.frame(fitcases = gmods_fra[[i]]$model$fitted.values) %>% 
+    dplyr::mutate(nyear = seq.int(from = 1, by = 1, length.out = n()),
+                  success = gmods_fra[[i]]$success)
+}
+
+# smooth_fra |>
+#   enframe() |>
+#   unnest(cols = c(value)) |>
+#   select(name, success) |>
+#   distinct() |>
+#   filter(success == 0)
+
+ts_fra <- smooth_fra |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+tslabels_fra <- tibble(name = names(ts_fra),
+                      group = 1:length(ts_fra))
+
+# write_rds(ts_fra, "data/interim/ts_fra.rds")
+# write_rds(tslabels_fra, "data/interim/tslabels_fra.rds")
+```
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+fra |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(N_IPD != 0) |> 
+  left_join(smooth_fra |> enframe() |> unnest(cols = c(value)) |> filter(success == 1), by = c("name", "nyear")) |> 
+  ggplot(aes(x = nyear, y = N_IPD)) +
+  geom_line() +
+  geom_line(aes(y = fitcases), color = "red") +
+  facet_wrap(~name, scales = "free_y") +
+  theme_bw()
+```
+
+### DTW clustering {.tabset}
+
+#### raw, Z-score
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_fra_raw <- fra |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_fra_raw <- tibble(name = names(ts_fra_raw),
+                          group = 1:length(ts_fra_raw))
+
+dtw_fra2 <- dtwclust::tsclust(ts_fra_raw,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_fra2 <- as.data.frame((ggplot_build(plot(dtw_fra2, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_fra_raw, by = "group")
+
+hc_centroid_fra2 <- as.data.frame((ggplot_build(plot(dtw_fra2, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_fra2 <- label(dendro_data(as.dendrogram(dtw_fra2))) |> 
+  left_join(hc_members_fra2 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_fra2 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_fra2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "bottom") + 
+  geom_point(data = labs_fra2, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+#### raw, log-transformed
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_fra_rawlog <- fra |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  mutate(N_IPD = log(N_IPD+1)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_fra_rawlog <- tibble(name = names(ts_fra_rawlog),
+                          group = 1:length(ts_fra_rawlog))
+
+dtw_fra3 <- dtwclust::tsclust(ts_fra_rawlog,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = NULL,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_fra3 <- as.data.frame((ggplot_build(plot(dtw_fra3, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_fra_rawlog, by = "group")
+
+hc_centroid_fra3 <- as.data.frame((ggplot_build(plot(dtw_fra3, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_fra3 <- label(dendro_data(as.dendrogram(dtw_fra3))) |> 
+  left_join(hc_members_fra3 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_fra3 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_fra3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "bottom") + 
+  geom_point(data = labs_fra3, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+## Spain
+
+PCV-7 in 2001, PCV-13 (and PCV-10 but less) in 2010
+
+```{r, echo = FALSE}
+spa <- eur |> 
+  filter(country == "Spain") |> 
+  select(-country) |> 
+  #complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(st != "NTYP") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number(),
+         tot_cases = sum(N_IPD),
+         numb_year = length(unique(nyear))) |> 
+  ungroup() |> 
+  filter(tot_cases > 50,
+         numb_year == 11) |>
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+```
+
+### Smooth with p-splines
+
+```{r}
+gmods_spa <- list()
+
+for (i in names(spa)) {
+  gmods_spa[[i]] <- tryCatch(
+    {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, k = nrow(spa[[i]])),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = spa[[i]]),
+        success = 1
+      )
+    },
+    warning = function(w) {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, k = nrow(spa[[i]])),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = spa[[i]]),
+        success = 0
+      )
+    }
+  )
+}
+
+smooth_spa <- list()
+
+for (i in names(spa)){
+  smooth_spa[[i]] = data.frame(fitcases = gmods_spa[[i]]$model$fitted.values) %>% 
+    dplyr::mutate(nyear = seq.int(from = 1, by = 1, length.out = n()),
+                  success = gmods_spa[[i]]$success)
+}
+
+# smooth_spa |>
+#   enframe() |>
+#   unnest(cols = c(value)) |>
+#   select(name, success) |>
+#   distinct() |>
+#   filter(success == 0)
+
+ts_spa <- smooth_spa |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+tslabels_spa <- tibble(name = names(ts_spa),
+                      group = 1:length(ts_spa))
+
+# write_rds(ts_spa, "data/interim/ts_spa.rds")
+# write_rds(tslabels_spa, "data/interim/tslabels_spa.rds")
+```
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+spa |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(N_IPD != 0) |> 
+  left_join(smooth_spa |> enframe() |> unnest(cols = c(value)) |> filter(success == 1), by = c("name", "nyear")) |> 
+  ggplot(aes(x = nyear, y = N_IPD)) +
+  geom_line() +
+  geom_line(aes(y = fitcases), color = "red") +
+  facet_wrap(~name, scales = "free_y") +
+  theme_bw()
+```
+
+### DTW clustering {.tabset}
+
+#### raw, Z-score
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_spa_raw <- spa |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_spa_raw <- tibble(name = names(ts_spa_raw),
+                          group = 1:length(ts_spa_raw))
+
+dtw_spa2 <- dtwclust::tsclust(ts_spa_raw,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_spa2 <- as.data.frame((ggplot_build(plot(dtw_spa2, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_spa_raw, by = "group")
+
+hc_centroid_spa2 <- as.data.frame((ggplot_build(plot(dtw_spa2, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_spa2 <- label(dendro_data(as.dendrogram(dtw_spa2))) |> 
+  left_join(hc_members_spa2 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_spa2 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_spa2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "bottom") + 
+  geom_point(data = labs_spa2, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+#### raw, log-transformed
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_spa_rawlog <- spa |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  mutate(N_IPD = log(N_IPD+1)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_spa_rawlog <- tibble(name = names(ts_spa_rawlog),
+                          group = 1:length(ts_spa_rawlog))
+
+dtw_spa3 <- dtwclust::tsclust(ts_spa_rawlog,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = NULL,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_spa3 <- as.data.frame((ggplot_build(plot(dtw_spa3, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_spa_rawlog, by = "group")
+
+hc_centroid_spa3 <- as.data.frame((ggplot_build(plot(dtw_spa3, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_spa3 <- label(dendro_data(as.dendrogram(dtw_spa3))) |> 
+  left_join(hc_members_spa3 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_spa3 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_spa3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "bottom") + 
+  geom_point(data = labs_spa3, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+## Sweden 
+
+PCV-7 in 2009, PCV-10 and PCV-13 in 2010
+
+```{r, echo = FALSE}
+swe <- eur |> 
+  filter(country == "Sweden") |> 
+  select(-country) |> 
+  #complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(st != "NTYP") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number(),
+         tot_cases = sum(N_IPD),
+         numb_year = length(unique(nyear))) |> 
+  ungroup() |> 
+  filter(tot_cases > 50,
+         numb_year == 10) |>
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+```
+
+### Smooth with p-splines
+
+```{r}
+gmods_swe <- list()
+
+for (i in names(swe)) {
+  gmods_swe[[i]] <- tryCatch(
+    {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, k = nrow(swe[[i]])),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = swe[[i]]),
+        success = 1
+      )
+    },
+    warning = function(w) {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, k = nrow(swe[[i]])),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = swe[[i]]),
+        success = 0
+      )
+    }
+  )
+}
+
+smooth_swe <- list()
+
+for (i in names(swe)){
+  smooth_swe[[i]] = data.frame(fitcases = gmods_swe[[i]]$model$fitted.values) %>% 
+    dplyr::mutate(nyear = seq.int(from = 1, by = 1, length.out = n()),
+                  success = gmods_swe[[i]]$success)
+}
+
+smooth_swe |>
+  enframe() |>
+  unnest(cols = c(value)) |>
+  select(name, success) |>
+  distinct() |>
+  filter(success == 0)
+
+# no gam convergence for 45, 46, 48
+
+ts_swe <- smooth_swe |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+tslabels_swe <- tibble(name = names(ts_swe),
+                      group = 1:length(ts_swe))
+
+# write_rds(ts_swe, "data/interim/ts_swe.rds")
+# write_rds(tslabels_swe, "data/interim/tslabels_swe.rds")
+```
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+swe |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(N_IPD != 0) |> 
+  left_join(smooth_swe |> enframe() |> unnest(cols = c(value)) |> filter(success == 1), by = c("name", "nyear")) |> 
+  ggplot(aes(x = nyear, y = N_IPD)) +
+  geom_line() +
+  geom_line(aes(y = fitcases), color = "red") +
+  facet_wrap(~name, scales = "free_y") +
+  theme_bw()
+```
+
+### DTW clustering {.tabset}
+
+#### raw, Z-score
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_swe_raw <- swe |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_swe_raw <- tibble(name = names(ts_swe_raw),
+                          group = 1:length(ts_swe_raw))
+
+dtw_swe2 <- dtwclust::tsclust(ts_swe_raw,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_swe2 <- as.data.frame((ggplot_build(plot(dtw_swe2, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_swe_raw, by = "group")
+
+hc_centroid_swe2 <- as.data.frame((ggplot_build(plot(dtw_swe2, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_swe2 <- label(dendro_data(as.dendrogram(dtw_swe2))) |> 
+  left_join(hc_members_swe2 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_swe2 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_swe2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "bottom") + 
+  geom_point(data = labs_swe2, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+#### raw, log-transformed
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_swe_rawlog <- swe |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  mutate(N_IPD = log(N_IPD+1)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_swe_rawlog <- tibble(name = names(ts_swe_rawlog),
+                          group = 1:length(ts_swe_rawlog))
+
+dtw_swe3 <- dtwclust::tsclust(ts_swe_rawlog,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = NULL,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_swe3 <- as.data.frame((ggplot_build(plot(dtw_swe3, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_swe_rawlog, by = "group")
+
+hc_centroid_swe3 <- as.data.frame((ggplot_build(plot(dtw_swe3, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_swe3 <- label(dendro_data(as.dendrogram(dtw_swe3))) |> 
+  left_join(hc_members_swe3 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_swe3 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_swe3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "bottom") + 
+  geom_point(data = labs_swe3, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+## Austria
+
+PCV-10 in 2012
+
+```{r, echo = FALSE}
+aust <- eur |> 
+  filter(country == "Austria") |> 
+  select(-country) |> 
+  #complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(st != "NTYP") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number(),
+         tot_cases = sum(N_IPD),
+         numb_year = length(unique(nyear))) |> 
+  ungroup() |> 
+  filter(tot_cases > 50,
+         numb_year == 9) |>
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+```
+
+### Smooth with p-splines
+
+```{r}
+gmods_aust <- list()
+
+for (i in names(aust)) {
+  gmods_aust[[i]] <- tryCatch(
+    {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, k = nrow(aust[[i]])),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = aust[[i]]),
+        success = 1
+      )
+    },
+    warning = function(w) {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, k = nrow(aust[[i]])),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = aust[[i]]),
+        success = 0
+      )
+    }
+  )
+}
+
+smooth_aust <- list()
+
+for (i in names(aust)){
+  smooth_aust[[i]] = data.frame(fitcases = gmods_aust[[i]]$model$fitted.values) %>% 
+    dplyr::mutate(nyear = seq.int(from = 1, by = 1, length.out = n()),
+                  success = gmods_aust[[i]]$success)
+}
+
+smooth_aust |>
+  enframe() |>
+  unnest(cols = c(value)) |>
+  select(name, success) |>
+  distinct() |>
+  filter(success == 0)
+
+# no gam convergence for 45, 46, 48
+
+ts_aust <- smooth_aust |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+tslabels_aust <- tibble(name = names(ts_aust),
+                      group = 1:length(ts_aust))
+
+# write_rds(ts_aust, "data/interim/ts_aust.rds")
+# write_rds(tslabels_aust, "data/interim/tslabels_aust.rds")
+```
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+aust |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(N_IPD != 0) |> 
+  left_join(smooth_aust |> enframe() |> unnest(cols = c(value)) |> filter(success == 1), by = c("name", "nyear")) |> 
+  ggplot(aes(x = nyear, y = N_IPD)) +
+  geom_line() +
+  geom_line(aes(y = fitcases), color = "red") +
+  facet_wrap(~name, scales = "free_y") +
+  theme_bw()
+```
+
+### DTW clustering {.tabset}
+
+#### raw, Z-score
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_aust_raw <- aust |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_aust_raw <- tibble(name = names(ts_aust_raw),
+                          group = 1:length(ts_aust_raw))
+
+dtw_aust2 <- dtwclust::tsclust(ts_aust_raw,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_aust2 <- as.data.frame((ggplot_build(plot(dtw_aust2, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_aust_raw, by = "group")
+
+hc_centroid_aust2 <- as.data.frame((ggplot_build(plot(dtw_aust2, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_aust2 <- label(dendro_data(as.dendrogram(dtw_aust2))) |> 
+  left_join(hc_members_aust2 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_aust2 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_aust2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "bottom") + 
+  geom_point(data = labs_aust2, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+#### raw, log-transformed
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_aust_rawlog <- aust |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  mutate(N_IPD = log(N_IPD+1)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_aust_rawlog <- tibble(name = names(ts_aust_rawlog),
+                          group = 1:length(ts_aust_rawlog))
+
+dtw_aust3 <- dtwclust::tsclust(ts_aust_rawlog,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = NULL,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_aust3 <- as.data.frame((ggplot_build(plot(dtw_aust3, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_aust_rawlog, by = "group")
+
+hc_centroid_aust3 <- as.data.frame((ggplot_build(plot(dtw_aust3, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_aust3 <- label(dendro_data(as.dendrogram(dtw_aust3))) |> 
+  left_join(hc_members_aust3 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_aust3 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_aust3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "bottom") + 
+  geom_point(data = labs_aust3, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+## Netherlands
+
+PCV-7 in 2006, PCV-10 in 2011
+
+```{r, echo = FALSE}
+net <- eur |> 
+  filter(country == "Netherlands") |> 
+  select(-country) |> 
+  #complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(st != "NTYP") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number(),
+         tot_cases = sum(N_IPD),
+         numb_year = length(unique(nyear))) |> 
+  ungroup() |> 
+  filter(tot_cases > 50,
+         numb_year == 11) |>
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+```
+
+### Smooth with p-splines
+
+```{r}
+gmods_net <- list()
+
+for (i in names(net)) {
+  gmods_net[[i]] <- tryCatch(
+    {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, k = nrow(net[[i]])),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = net[[i]]),
+        success = 1
+      )
+    },
+    warning = function(w) {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, k = nrow(net[[i]])),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = net[[i]]),
+        success = 0
+      )
+    }
+  )
+}
+
+smooth_net <- list()
+
+for (i in names(net)){
+  smooth_net[[i]] = data.frame(fitcases = gmods_net[[i]]$model$fitted.values) %>% 
+    dplyr::mutate(nyear = seq.int(from = 1, by = 1, length.out = n()),
+                  success = gmods_net[[i]]$success)
+}
+
+smooth_net |>
+  enframe() |>
+  unnest(cols = c(value)) |>
+  select(name, success) |>
+  distinct() |>
+  filter(success == 0)
+
+# no gam convergence for 45, 46, 48
+
+ts_net <- smooth_net |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+tslabels_net <- tibble(name = names(ts_net),
+                      group = 1:length(ts_net))
+
+# write_rds(ts_net, "data/interim/ts_net.rds")
+# write_rds(tslabels_net, "data/interim/tslabels_net.rds")
+```
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+net |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  left_join(smooth_net |> enframe() |> unnest(cols = c(value)) |> filter(success == 1), by = c("name", "nyear")) |> 
+  ggplot(aes(x = nyear, y = N_IPD)) +
+  geom_line() +
+  geom_line(aes(y = fitcases), color = "red") +
+  facet_wrap(~name, scales = "free_y") +
+  theme_bw()
+```
+
+### DTW clustering {.tabset}
+
+#### raw, Z-score
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_net_raw <- net |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_net_raw <- tibble(name = names(ts_net_raw),
+                          group = 1:length(ts_net_raw))
+
+dtw_net2 <- dtwclust::tsclust(ts_net_raw,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_net2 <- as.data.frame((ggplot_build(plot(dtw_net2, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_net_raw, by = "group")
+
+hc_centroid_net2 <- as.data.frame((ggplot_build(plot(dtw_net2, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_net2 <- label(dendro_data(as.dendrogram(dtw_net2))) |> 
+  left_join(hc_members_net2 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_net2 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_net2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "bottom") + 
+  geom_point(data = labs_net2, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+#### raw, log-transformed
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_net_rawlog <- net |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  mutate(N_IPD = log(N_IPD+1)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_net_rawlog <- tibble(name = names(ts_net_rawlog),
+                          group = 1:length(ts_net_rawlog))
+
+dtw_net3 <- dtwclust::tsclust(ts_net_rawlog,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = NULL,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_net3 <- as.data.frame((ggplot_build(plot(dtw_net3, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_net_rawlog, by = "group")
+
+hc_centroid_net3 <- as.data.frame((ggplot_build(plot(dtw_net3, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_net3 <- label(dendro_data(as.dendrogram(dtw_net3))) |> 
+  left_join(hc_members_net3 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_net3 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_net3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "bottom") + 
+  geom_point(data = labs_net3, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+## Denmark and Norway
+
+PCV-7 in 2006, PCV-10 in 2011
+
+```{r, echo = FALSE}
+scand <- eur |> 
+  filter(country %in% c("Norway", "Denmark")) |> 
+  select(-country) |> 
+  #complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(st != "NTYP") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number(),
+         tot_cases = sum(N_IPD),
+         numb_year = length(unique(nyear))) |> 
+  ungroup() |> 
+  filter(tot_cases > 50,
+         numb_year == 22) |>
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+```
+
+### Smooth with p-splines
+
+```{r}
+gmods_scand <- list()
+
+for (i in names(scand)) {
+  gmods_scand[[i]] <- tryCatch(
+    {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, k = nrow(scand[[i]])),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = scand[[i]]),
+        success = 1
+      )
+    },
+    warning = function(w) {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, k = nrow(scand[[i]])),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = scand[[i]]),
+        success = 0
+      )
+    }
+  )
+}
+
+smooth_scand <- list()
+
+for (i in names(scand)){
+  smooth_scand[[i]] = data.frame(fitcases = gmods_scand[[i]]$model$fitted.values) %>% 
+    dplyr::mutate(nyear = seq.int(from = 1, by = 1, length.out = n()),
+                  success = gmods_scand[[i]]$success)
+}
+
+# smooth_scand |>
+#   enframe() |>
+#   unnest(cols = c(value)) |>
+#   select(name, success) |>
+#   distinct() |>
+#   filter(success == 0)
+
+ts_scand <- smooth_scand |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+tslabels_scand <- tibble(name = names(ts_scand),
+                      group = 1:length(ts_scand))
+
+# write_rds(ts_scand, "data/interim/ts_scand.rds")
+# write_rds(tslabels_scand, "data/interim/tslabels_scand.rds")
+```
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+scand |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(N_IPD != 0) |> 
+  left_join(smooth_scand |> enframe() |> unnest(cols = c(value)) |> filter(success == 1), by = c("name", "nyear")) |> 
+  ggplot(aes(x = nyear, y = N_IPD)) +
+  geom_line() +
+  geom_line(aes(y = fitcases), color = "red") +
+  facet_wrap(~name, scales = "free_y") +
+  theme_bw()
+```
+
+### DTW clustering {.tabset}
+
+#### raw, Z-score
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_scand_raw <- scand |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_scand_raw <- tibble(name = names(ts_scand_raw),
+                          group = 1:length(ts_scand_raw))
+
+dtw_scand2 <- dtwclust::tsclust(ts_scand_raw,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_scand2 <- as.data.frame((ggplot_build(plot(dtw_scand2, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_scand_raw, by = "group")
+
+hc_centroid_scand2 <- as.data.frame((ggplot_build(plot(dtw_scand2, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_scand2 <- label(dendro_data(as.dendrogram(dtw_scand2))) |> 
+  left_join(hc_members_scand2 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_scand2 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_scand2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "bottom") + 
+  geom_point(data = labs_scand2, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+#### raw, log-transformed
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_scand_rawlog <- scand |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  mutate(N_IPD = log(N_IPD+1)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_scand_rawlog <- tibble(name = names(ts_scand_rawlog),
+                          group = 1:length(ts_scand_rawlog))
+
+dtw_scand3 <- dtwclust::tsclust(ts_scand_rawlog,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = NULL,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_scand3 <- as.data.frame((ggplot_build(plot(dtw_scand3, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_scand_rawlog, by = "group")
+
+hc_centroid_scand3 <- as.data.frame((ggplot_build(plot(dtw_scand3, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_scand3 <- label(dendro_data(as.dendrogram(dtw_scand3))) |> 
+  left_join(hc_members_scand3 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_scand3 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_scand3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "bottom") + 
+  geom_point(data = labs_scand3, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```
+
+## Germany
+
+PCV-13 introduced in 2009
+
+```{r, echo = FALSE}
+ger_raw <- read_csv("data/DE_IPD_deidentified.csv")
+
+ger <- ger_raw |> 
+  mutate(date = as.Date(DateOfIsolation, format = "%d/%m/%Y"),
+         year = year(date),
+         st = str_to_upper(Serotype),
+         st = case_when(st == "6B OLD" ~ "6B",
+                        st == "6A OLD" ~ "6A",
+                        st == "SEROGRUPPE 24" ~ "24",
+                        st == "SEROGRUPPE 35" ~ "35",
+                        .default = st)) |>  
+  filter(!is.na(st) & st != "NT" & st != "GRUPPE 35/42" & !is.na(date)) |> 
+  group_by(year, st) |> 
+  summarise(N_IPD = n()) |> 
+  ungroup() |> 
+  complete(year, st, fill = list(N_IPD = 0)) |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number(),
+         tot_cases = sum(N_IPD)) |> 
+  ungroup() |> 
+  filter(tot_cases > 50) |>
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+
+ger2 <- ger_raw |> 
+  mutate(date = as.Date(DateOfIsolation, format = "%d/%m/%Y"),
+         year = year(date),
+         st = str_to_upper(Serotype),
+         st = case_when(st == "6B OLD" ~ "6B",
+                        st == "6A OLD" ~ "6A",
+                        st == "SEROGRUPPE 24" ~ "24",
+                        st == "SEROGRUPPE 35" ~ "35",
+                        .default = st)) |>  
+  filter(!is.na(st) & st != "NT" & st != "GRUPPE 35/42" & !is.na(date)) |> 
+  group_by(year, st) |> 
+  summarise(N_IPD = n()) |> 
+  ungroup() |> 
+  complete(year, st, fill = list(N_IPD = 0)) |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number(),
+         tot_cases = sum(N_IPD)) |> 
+  ungroup() |> 
+  filter(tot_cases > 50) |>
+  dplyr::select(st, N_IPD, year)
+```
+
+```{r, fig.width = 12, fig.height = 7}
+ger2 |> 
+  ggplot(aes(x = as.integer(year), y = N_IPD)) +
+  geom_vline(aes(xintercept = 2009, color = "PCV13 introduced"), lty = 2) +
+  scale_color_manual(values = c("PCV13 introduced" = "red")) +
+  geom_line() +
+  facet_wrap(~st, scales = "free_y") +
+  scale_x_continuous(breaks = c(2010, 2015, 2020)) +
+  labs(x = "", y = "IPD cases", color = "") +
+  theme_bw() +
+  theme(legend.position = "inside",
+        legend.position.inside = c(0.93,0.07))
+```
+
+### DTW clustering
+
+#### raw, Z-score
+
+k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+ts_ger_raw <- ger |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  group_by(name) |> 
+  summarise(N_IPD = list(N_IPD)) |> 
+  pull(N_IPD, name = name)
+
+tslabels_ger_raw <- tibble(name = names(ts_ger_raw),
+                          group = 1:length(ts_ger_raw))
+
+dtw_ger2 <- dtwclust::tsclust(ts_ger_raw,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_ger2 <- as.data.frame((ggplot_build(plot(dtw_ger2, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_ger_raw, by = "group")
+
+hc_centroid_ger2 <- as.data.frame((ggplot_build(plot(dtw_ger2, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_ger2 <- label(dendro_data(as.dendrogram(dtw_ger2))) |> 
+  left_join(hc_members_ger2 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL) |> 
+  mutate(Vaccine = if_else(label %in% pcv7_st, "PCV-7", if_else(label%in% pcv13_stlab, "PCV-13", "NA")))
+
+ggplotly(hc_members_ger2 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_ger2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_ger2, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
+```

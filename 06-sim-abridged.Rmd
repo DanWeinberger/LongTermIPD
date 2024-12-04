@@ -1,0 +1,1370 @@
+---
+title: "Simulation"
+author: "Paloma Cárcamo"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, echo = FALSE, message = FALSE, warning = FALSE}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, rjags, tidybayes)
+#knitr::opts_chunk$set(cache = TRUE)
+```
+
+```{r}
+pcv7_st <- c("4","6B","9V","14","18C","19F","23F")
+pcv13_st <- c("1","3","4","5","6A","6B","7F","9V","14","18C","19A","19F","23F")
+pcv15_st <- c("1","3","4","5","6A","6B","7F","9V","14","18C","19A","19F","22F","23F","33F")
+pcv20_st <- c("1","3","4","5","6A","6B","7F","8","9V","10A","11A","12F","14","15B","18C","19A","19F","22F","23F","33F")
+
+data_raw <- read_rds("data/ABCs_st_1998_2021.rds")
+
+data <- data_raw |> 
+  rename(agec = "Age.Group..years.",
+         year = Year,
+         st = IPD.Serotype,
+         N_IPD = Frequency.Count)  |> 
+  mutate(st = if_else(st == '16', '16F', st))  |> 
+  group_by(st, year) |> 
+  summarize(N_IPD = sum(N_IPD))  |> 
+  ungroup() |> 
+  complete(year, st, fill = list(N_IPD = 0)) |> 
+  mutate(pcv7 = if_else(st %in% pcv7_st, 1, 0),
+         pcv13 = if_else(st %in% pcv13_st, 1, 0),
+         pcv15 = if_else(st %in% pcv15_st, 1, 0),
+         pcv20 = if_else(st %in% pcv20_st, 1, 0),
+         firstvax = case_when(pcv7 == 1 ~ "pcv7",
+                              pcv13 == 1 ~ "pcv13",
+                              pcv15 == 1 ~ "pcv15",
+                              pcv20 == 1 ~ "pcv20",
+                              .default = ""))
+```
+
+```{r}
+mod9_df <- data |> 
+  complete(st, year, fill = list(N_IPD = 0))  |> 
+  arrange(st, year) |> 
+  filter(st %in% pcv13_st)  |> 
+  group_by(st) |> 
+  arrange(year) |> 
+  mutate(year_n = row_number()) |> 
+  ungroup()
+
+mod9_mat <- mod9_df |> 
+  reshape2::dcast(year ~ st, value.var = 'N_IPD') |> 
+  dplyr::select(-year)
+
+st_mapping9 <- setNames(colnames(mod9_mat), 1:length(pcv13_st))
+year_mapping9 <- setNames(unique(mod9_df$year), 1:length(unique(mod9_df$year)))
+```
+
+```{r}
+inits1 = list(".RNG.seed"=c(123), ".RNG.name"='base::Wichmann-Hill')
+inits2 = list(".RNG.seed"=c(456), ".RNG.name"='base::Wichmann-Hill')
+inits3 = list(".RNG.seed"=c(789), ".RNG.name"='base::Wichmann-Hill')
+```
+
+## Create simulated dataset 1
+
+```{r}
+N_years <- max(mod9_df$year_n)
+N_sts <- ncol(mod9_mat)
+
+set.seed(100)
+
+# Priors
+pi <- 0.5
+alpha1 <- 3 # global intercept
+tau_global <- 0.7 # st-specific variance
+
+rho_beta1 <- 0.9 # autocorrelation for beta1
+rho_beta2 <- 0.9 # autocorrelation for beta2
+rho_eps <- 0.9 # autocorrelation for st-specific ar1s
+
+tau_beta1 <- 0.4 # variance for beta1
+tau_beta2 <- 0.2 # variance for beta2
+tau_eps <- 0.3 # variance for st-specific ar1s
+
+delta1 <- numeric(N_sts)
+r <- numeric(N_sts)
+grp <- numeric(N_sts)
+
+for(j in 1:N_sts){
+  delta1[j] <- 4
+  r[j] <- runif(1, 0, 250)  # Serotype dispersion parameter
+  grp[j] <- rbinom(1, 1, pi)
+}
+
+# Serotype-specific AR(1)
+epsilon1 <- matrix(nrow = N_years, ncol = N_sts)
+
+for(j in 1:N_sts){
+  epsilon1[1,j] <- rnorm(1, 0, (1 - rho_eps^2) * tau_eps)
+  
+  for(i in 2:N_years){
+    epsilon1[i,j] <- rnorm(1, rho_eps * epsilon1[i-1, j], tau_eps)
+  }
+}
+
+# Global AR(1) - beta 1
+
+beta1 <- numeric(N_years)
+
+beta1[1] <- 0.2
+for(i in 2:N_years){
+  beta1[i] <- rnorm(1, rho_beta1 * beta1[i-1], tau_beta1)
+}
+
+# Global AR(1) - beta2
+
+beta2 <- numeric(N_years)
+
+beta2[1] <- 2
+for(i in 2:N_years){
+  beta2[i] <- rnorm(1, rho_beta2 * beta2[i-1], tau_beta2)
+}
+
+# Case counts
+
+lambda <- matrix(nrow = N_years, ncol = N_sts)
+prob <- matrix(nrow = N_years, ncol = N_sts)
+N_IPD <- matrix(nrow = N_years, ncol = N_sts)
+
+for(i in 1:N_years){
+  
+  for(j in 1:N_sts){
+    lambda[i,j] <- exp(alpha1 + delta1[j] + epsilon1[i,j] + grp[j]*beta1[i] + ((1-grp[j])*beta2[i]))
+    
+    N_IPD[i,j] <- rpois(n = 1, lambda = lambda[i,j])
+    
+    }
+}
+
+pre_simulated_data <- data.frame(N_IPD)
+colnames(pre_simulated_data) <- 1:N_sts
+rownames(pre_simulated_data) <- 1:N_years
+
+simulated_data <- pre_simulated_data |>
+  rownames_to_column("year") |>
+  pivot_longer(cols = 2:14, names_to = "st", values_to = "N_IPD") |>
+  mutate(year = as.numeric(year),
+         N_IPD = as.numeric(N_IPD),
+         group = rep(grp, N_years),
+         st = as.numeric(st))
+```
+
+```{r, echo = FALSE, fig.width = 11}
+# simulated_data |> 
+#   dplyr::select(group, st) |> 
+#   distinct() |> 
+#   mutate(group = if_else(group < 0.5, "Group 1 (beta1)", "Group 2 (beta2)")) |> 
+#   group_by(group) |> 
+#   summarise(serotypes = paste0(st, collapse = " ,"))
+
+simulated_data |> 
+  ggplot(aes(x = year, y = N_IPD, color = as.factor(st))) +
+  geom_line() +
+  labs(color = "serotype") +
+  facet_wrap(group~., scales = "free_y") +
+  theme_bw()
+
+g0 <- simulated_data |> 
+  filter(group == 0) |> 
+  ggplot(aes(x = year, y = N_IPD, color = as.factor(st))) +
+  geom_line(show.legend = FALSE) +
+  labs(color = "serotype", title = "Group = 0") +
+  facet_wrap(~st, scales = "free_y") +
+  theme_bw()
+
+g1 <- simulated_data |> 
+  filter(group == 1) |> 
+  ggplot(aes(x = year, y = N_IPD, color = as.factor(st))) +
+  geom_line(show.legend = FALSE) +
+  labs(color = "serotype", title = "Group = 1") +
+  facet_wrap(~st, scales = "free_y") +
+  theme_bw()
+
+gridExtra::grid.arrange(g0, g1, ncol = 2)
+```
+
+```{r, echo = FALSE}
+mod14_df <- simulated_data |> 
+  ungroup() |> 
+  complete(st, year, fill = list(N_IPD = 0))  |> 
+  arrange(st, year) |> 
+  group_by(st) |> 
+  arrange(year) |> 
+  mutate(year_n = row_number()) |> 
+  ungroup()
+
+mod14_mat <- mod14_df |> 
+  reshape2::dcast(year ~ st, value.var = 'N_IPD') |> 
+  dplyr::select(-year)
+
+st_mapping14 <- setNames(colnames(mod14_mat), 1:length(unique(mod14_df$st)))
+year_mapping14 <- setNames(unique(mod14_df$year), 1:length(unique(mod14_df$year)))
+```
+
+### Define model string
+
+```{r}
+mod14_string <- "
+  model {
+   
+    for(i in 1:N_years){
+     
+      for(j in 1:N_sts){
+        N_IPD[i,j] ~ dnegbin(prob[i,j], r[j])
+       
+        prob[i,j] <- r[j] / (r[j] + lambda[i,j])  # Likelihood
+       
+        log(lambda[i,j]) <- alpha1 + # Global intercept
+                            delta1[j] + # Serotype intercept
+                            epsilon1[i,j] + # Serotype-specific AR(1), 0 centered
+                            grp[j]*(beta1[i]) + (1-grp[j])*(beta2[i]) # Global AR(1) version 1 or 2, 0 centered
+
+      }
+    }
+   
+    # Global AR(1) effect for beta1
+   
+    beta1[1] ~ dnorm(0, (1 - rho_beta1^2) * tau_beta1)
+    for(i in 2:N_years){
+      beta1[i] ~ dnorm(rho_beta1 * beta1[i-1], tau_beta1)
+    }
+   
+    # Global AR(1) effect for beta2
+   
+    beta2[1] ~ dnorm(0, (1 - rho_beta2^2) * tau_beta2)
+    for(i in 2:N_years){
+      beta2[i] ~ dnorm( rho_beta2 * beta2[i-1], tau_beta2)
+    }
+       
+    # Serotype-specific AR(1) effect
+    for(j in 1:N_sts){
+      epsilon1[1,j] ~ dnorm(0, (1 - rho_eps^2) * tau_eps)
+     
+      for(i in 2:N_years){
+        epsilon1[i,j] ~ dnorm(0, tau_eps)
+      }
+    }
+   
+    # Priors for group selection
+    for(j in 1:N_sts){
+      grp[j] ~ dbern(pi)  # Group assignment - 0 or 1
+    }
+   
+    pi ~ dunif(0,1)
+       
+    # Priors
+    alpha1 ~ dnorm(0, 1e-4)
+    tau_global ~ dgamma(0.01, 0.01)
+
+    rho_beta1 ~ dunif(-1, 1)   # Uniform prior for rho_beta1 -- global AR(1) for beta1
+    rho_beta2 ~ dunif(-1, 1)   # Uniform prior for rho_beta2 -- global AR(1) for beta2
+    rho_eps ~ dunif(-1, 1)     # Prior for rho_eps same for all STs
+   
+    tau_beta1 ~ dgamma(3, 2)   # Tight prior for tau for beta1
+    tau_beta2 ~ dgamma(3, 2)   # Tight prior for tau for beta2
+    tau_eps ~ dgamma(3, 2)     # Tight prior for tau, shared for all serotypes
+   
+    for(j in 1:N_sts){
+      delta1[j] ~ dnorm(0, tau_global)  # Serotype means centered around 0
+      r[j] ~ dunif(0, 250)  # Serotype dispersion parameter
+    }
+  }
+"
+```
+
+### Create JAGS model object
+
+```{r, eval = FALSE}
+mod14 <- jags.model(textConnection(mod14_string),
+                   data = list("N_IPD" = mod14_mat,
+                               "N_years" = max(mod14_df$year_n),
+                               "N_sts" = ncol(mod14_mat)),
+                   inits = list(inits1, inits2, inits3),
+                   n.adapt = 10000,
+                   n.chains = 3)
+```
+
+### Sample posteriors
+
+```{r, eval = FALSE}
+params14 <- c("alpha1", "epsilon1", "delta1", "beta1", "beta2", "tau_beta1", "tau_beta2", "lambda", "rho_beta1", "rho_beta2", "rho_eps", "pi", "grp", "r", "tau_global", "tau_eps", "prob", "N_IPD")
+
+mod14_postsamp <- coda.samples(mod14, params14, n.iter = 50000)
+
+# save(mod14_postsamp, file = "data/interim/mod14_postsamp.rda")
+```
+
+```{r, echo = FALSE}
+load("data/interim/mod14_postsamp.rda")
+```
+
+### Plot traces for alpha1 + delta[j] + grp[j]\*(beta1[i] ) + (1-grp[j])\*(beta2[i]) ¡ epsilon1 {.tabset}
+
+```{r, echo = FALSE}
+grp_samples <- mod14_postsamp[, grep("^grp\\[", varnames(mod14_postsamp), value = TRUE)]
+
+alpha1_samples <- mod14_postsamp[, "alpha1"]
+delta1_samples <- mod14_postsamp[, grep("^delta1\\[", varnames(mod14_postsamp), value = TRUE)]
+beta1_samples <- mod14_postsamp[, grep("^beta1\\[", varnames(mod14_postsamp), value = TRUE)]
+beta2_samples <- mod14_postsamp[, grep("^beta2\\[", varnames(mod14_postsamp), value = TRUE)]
+epsilon2_samples <- mod14_postsamp[, grep("^epsilon1\\[", varnames(mod14_postsamp), value = TRUE)]
+
+N_years <- ncol(beta1_samples[[1]])
+N_sts <- ncol(delta1_samples[[1]])
+
+combined_effect14a <- list()
+
+combined_effect14c <- list()
+```
+
+```{r, results = 'asis', echo = FALSE}
+for (i in 1:N_years) {
+  
+  cat(paste0("\n#### ", year_mapping14[i], " {.tabset}", "\n"))
+  cat("\n")
+  
+  for (j in 1:N_sts) {
+    for (chain in 1:3) { 
+      combined_effect14c[[chain]] <- alpha1_samples[[chain]] + 
+        delta1_samples[[chain]][, j] + 
+        beta1_samples[[chain]][, i]*grp_samples[[chain]][, j] +
+        beta2_samples[[chain]][, j]*(1-grp_samples[[chain]][, j]) + 
+        epsilon2_samples[[chain]][i,j]
+      }
+    
+    combined_mcmc14c <- mcmc.list(combined_effect14c)
+    
+    cat(paste0("\n##### ", st_mapping14[j]," \n"))
+    cat("\n")
+    traceplot(combined_mcmc14c, main = paste("Year", year_mapping14[i], "ST", st_mapping14[j]), 
+              xlab = "Iteration", ylab = "Combined Effect")
+    cat("\n")
+  }
+}
+```
+
+### Compare real vs model-estimated parameters {.tabset}
+
+#### Single params
+
+```{r, echo = FALSE, fig.width = 11, fig.height = 8}
+single_pars <- gather_draws(mod14_postsamp, c(pi, alpha1, tau_global, rho_beta1, rho_beta2, rho_eps, tau_beta1, tau_beta2, tau_eps)) |> 
+  median_hdci() |>
+  mutate(obs = case_when(.variable == "pi" ~ pi,
+                         .variable == "alpha1" ~ alpha1,
+                         .variable == "tau_global" ~ tau_global,
+                         .variable == "rho_beta1" ~ rho_beta1,
+                         .variable == "rho_beta2" ~ rho_beta2,
+                         .variable == "rho_eps" ~ rho_eps,
+                         .variable == "tau_beta1" ~ tau_beta1,
+                         .variable == "tau_beta2" ~ tau_beta2,
+                         .variable == "tau_eps" ~ tau_eps))
+
+single_pars |> 
+  ggplot(aes(x = 1)) +
+  geom_pointrange(aes(ymin = .lower, ymax = .upper, y = .value, color = "Estimated")) +
+  geom_point(aes(y = obs, color = "Real")) +
+  labs(x = "", y = "", color = "") +
+  facet_wrap(~.variable, scales = "free_y") +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+```
+
+#### delta1
+
+```{r, echo = FALSE}
+delta_est <- gather_draws(mod14_postsamp, delta1[j]) |> 
+  median_hdci() |> 
+  rename(st = j) |> 
+  mutate(obs = delta1)
+
+delta_est |> 
+  ggplot(aes(x = st)) +
+  geom_pointrange(aes(ymin = .lower, ymax = .upper, y = .value, color = "Estimated")) +
+  geom_point(aes(y = obs, color = "Real")) +
+  labs(x = "Serotype", y = "", color = "", title = "delta1 (serotype intercept)") +
+  theme_bw() +
+  scale_x_continuous(breaks = c(1:13))
+```
+
+```{r, echo = FALSE, eval = FALSE}
+r_est <- gather_draws(mod14_postsamp, r[j]) |> 
+  median_hdci() |> 
+  rename(st = j) |> 
+  mutate(obs = r)
+
+r_est |> 
+  ggplot(aes(x = st)) +
+  geom_pointrange(aes(ymin = .lower, ymax = .upper, y = .value, color = "Estimated")) +
+  geom_point(aes(y = obs, color = "Real")) +
+  labs(x = "Serotype", y = "", color = "", title = "r") +
+  theme_bw() +
+  scale_x_continuous(breaks = c(1:13))
+```
+
+#### grp
+
+```{r, echo = FALSE}
+grp_est <- gather_draws(mod14_postsamp, grp[j]) |> 
+  median_hdci() |> 
+  rename(st = j) |> 
+  mutate(obs = grp,
+         obs = if_else(grp == 0, 1, 0))
+
+grp_est |> 
+  ggplot(aes(x = st)) +
+  geom_pointrange(aes(ymin = .lower, ymax = .upper, y = .value, color = "Estimated"), size = 1.1) +
+  geom_point(aes(y = obs, color = "Real")) +
+  labs(x = "Serotype", y = "", color = "", title = "AR1 group assignment") +
+  theme_bw() +
+  scale_x_continuous(breaks = c(1:13))
+```
+
+#### beta1
+
+```{r, echo = FALSE}
+beta1_est <- gather_draws(mod14_postsamp, beta1[i]) |> 
+  median_hdci() |> 
+  rename(year = i) |> 
+  mutate(obs = beta1)
+
+beta1_est |> 
+  ggplot(aes(x = year)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper, fill = "Estimated"), alpha = 0.3, show.legend = FALSE) +
+  geom_line(aes(y = .value, color = "Estimated")) +
+  geom_line(aes(y = obs, color = "Real")) +
+  labs(x = "Year", y = "", color = "", title = "beta1 (global AR1)") +
+  theme_bw()
+```
+
+#### beta2
+
+```{r, echo = FALSE}
+beta2_est <- gather_draws(mod14_postsamp, beta2[i]) |> 
+  median_hdci() |> 
+  rename(year = i) |> 
+  mutate(obs = beta2)
+
+beta2_est |> 
+  ggplot(aes(x = year)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper, fill = "Estimated"), alpha = 0.3, show.legend = FALSE) +
+  geom_line(aes(y = .value, color = "Estimated")) +
+  geom_line(aes(y = obs, color = "Real")) +
+  labs(x = "Year", y = "", color = "", title = "beta2 (global AR1)") +
+  theme_bw()
+```
+
+#### epsilon1
+
+```{r, echo = FALSE, fig.width = 11, fig.height = 8}
+epsilon_est <- gather_draws(mod14_postsamp, epsilon1[i,j]) |> 
+  median_hdci() |> 
+  rename(st = j,
+         year = i) |> 
+  left_join(data.frame(epsilon1) |> 
+              rownames_to_column("year") |> 
+              pivot_longer(cols = c(2:14), names_to = "st", values_to = "obs", names_prefix = "X") |> 
+              mutate(year = as.numeric(year),
+                     st = as.numeric(st)), 
+            by = c("year", "st"))
+
+epsilon_est |> 
+  ggplot(aes(x = year)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper, fill = "Estimated"), alpha = 0.3, show.legend = FALSE) +
+  geom_line(aes(y = .value, color = "Estimated")) +
+  geom_line(aes(y = obs, color = "Real")) +
+  labs(x = "Year", y = "", color = "", title = "epsilon1 (serotype-specific AR1)") +
+  facet_wrap(~st) +
+  theme_bw()
+```
+
+#### lambda
+
+```{r, echo = FALSE, fig.width = 11, fig.height = 8}
+lambda_est <- gather_draws(mod14_postsamp, lambda[i,j]) |> 
+  median_hdci() |> 
+  rename(st = j,
+         year = i) |> 
+  left_join(data.frame(lambda) |> 
+              rownames_to_column("year") |> 
+              pivot_longer(cols = c(2:14), names_to = "st", values_to = "obs", names_prefix = "X") |> 
+              mutate(year = as.numeric(year),
+                     st = as.numeric(st)), 
+            by = c("year", "st"))
+
+lambda_est |> 
+  ggplot(aes(x = year)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper, fill = "Estimated"), alpha = 0.3, show.legend = FALSE) +
+  geom_line(aes(y = .value, color = "Estimated")) +
+  geom_line(aes(y = obs, color = "Real"), lty = 2) +
+  labs(x = "Year", y = "", color = "", title = "lambda (# cases)") +
+  facet_wrap(~st, scales = "free_y") +
+  theme_bw()
+```
+
+## Model with pi for each serotype
+
+### Create simulated dataset 3
+
+```{r}
+N_years <- max(mod9_df$year_n)
+N_sts <- ncol(mod9_mat)
+
+set.seed(100)
+
+# Priors
+alpha1 <- 3 # global intercept
+tau_global <- 0.7 # st-specific variance
+
+rho_beta1 <- 0.9 # autocorrelation for beta1
+rho_beta2 <- 0.9 # autocorrelation for beta2
+rho_eps <- 0.9 # autocorrelation for st-specific ar1s
+
+tau_beta1 <- 0.4 # variance for beta1
+tau_beta2 <- 0.2 # variance for beta2
+tau_eps <- 0.3 # variance for st-specific ar1s
+
+delta1 <- numeric(N_sts)
+r <- numeric(N_sts)
+grp <- numeric(N_sts)
+pi <- numeric(N_sts)
+
+for(j in 1:N_sts){
+  delta1[j] <- 4
+  r[j] <- runif(1, 0, 250)  # Serotype dispersion parameter
+  pi[j] <- runif(1, 0.25, 0.75)
+  grp[j] <- rbinom(1, 1, pi[j])
+}
+
+# Serotype-specific AR(1)
+epsilon1 <- matrix(nrow = N_years, ncol = N_sts)
+
+for(j in 1:N_sts){
+  epsilon1[1,j] <- rnorm(1, 0, (1 - rho_eps^2) * tau_eps)
+  
+  for(i in 2:N_years){
+    epsilon1[i,j] <- rnorm(1, rho_eps * epsilon1[i-1, j], tau_eps)
+  }
+}
+
+# Global AR(1) - beta 1
+
+beta1 <- numeric(N_years)
+
+beta1[1] <- 0.2
+for(i in 2:N_years){
+  beta1[i] <- rnorm(1, rho_beta1 * beta1[i-1], tau_beta1)
+}
+
+# Global AR(1) - beta2
+
+beta2 <- numeric(N_years)
+
+beta2[1] <- 2
+for(i in 2:N_years){
+  beta2[i] <- rnorm(1, rho_beta2 * beta2[i-1], tau_beta2)
+}
+
+# Case counts
+
+lambda <- matrix(nrow = N_years, ncol = N_sts)
+prob <- matrix(nrow = N_years, ncol = N_sts)
+N_IPD <- matrix(nrow = N_years, ncol = N_sts)
+
+for(i in 1:N_years){
+  
+  for(j in 1:N_sts){
+    lambda[i,j] <- exp(alpha1 + delta1[j] + epsilon1[i,j] + grp[j]*beta1[i] + ((1-grp[j])*beta2[i]))
+    
+    N_IPD[i,j] <- rpois(n = 1, lambda = lambda[i,j])
+    
+    }
+}
+
+pre_simulated_data3 <- data.frame(N_IPD)
+colnames(pre_simulated_data3) <- 1:N_sts
+rownames(pre_simulated_data3) <- 1:N_years
+
+simulated_data3 <- pre_simulated_data3 |>
+  rownames_to_column("year") |>
+  pivot_longer(cols = 2:14, names_to = "st", values_to = "N_IPD") |>
+  mutate(year = as.numeric(year),
+         N_IPD = as.numeric(N_IPD),
+         group = rep(grp, N_years),
+         st = as.numeric(st))
+```
+
+```{r, echo = FALSE, fig.width = 11}
+# simulated_data |> 
+#   dplyr::select(group, st) |> 
+#   distinct() |> 
+#   mutate(group = if_else(group < 0.5, "Group 1 (beta1)", "Group 2 (beta2)")) |> 
+#   group_by(group) |> 
+#   summarise(serotypes = paste0(st, collapse = " ,"))
+
+simulated_data3 |> 
+  ggplot(aes(x = year, y = N_IPD, color = as.factor(st))) +
+  geom_line() +
+  labs(color = "serotype") +
+  facet_wrap(group~., scales = "free_y") +
+  theme_bw()
+
+g0_3 <- simulated_data3 |> 
+  filter(group == 0) |> 
+  ggplot(aes(x = year, y = N_IPD, color = as.factor(st))) +
+  geom_line(show.legend = FALSE) +
+  labs(color = "serotype", title = "Group = 0") +
+  facet_wrap(~st, scales = "free_y") +
+  theme_bw()
+
+g1_3 <- simulated_data3 |> 
+  filter(group == 1) |> 
+  ggplot(aes(x = year, y = N_IPD, color = as.factor(st))) +
+  geom_line(show.legend = FALSE) +
+  labs(color = "serotype", title = "Group = 1") +
+  facet_wrap(~st, scales = "free_y") +
+  theme_bw()
+
+gridExtra::grid.arrange(g0_3, g1_3, ncol = 2)
+```
+
+### Define model string
+
+```{r}
+mod15_string <- "
+  model {
+   
+    for(i in 1:N_years){
+     
+      for(j in 1:N_sts){
+        N_IPD[i,j] ~ dnegbin(prob[i,j], r[j])
+       
+        prob[i,j] <- r[j] / (r[j] + lambda[i,j])  # Likelihood
+       
+        log(lambda[i,j]) <- alpha1 + # Global intercept
+                            delta1[j] + # Serotype intercept
+                            epsilon1[i,j] + # Serotype-specific AR(1), 0 centered
+                            grp[j]*(beta1[i]) + (1-grp[j])*(beta2[i]) # Global AR(1) version 1 or 2, 0 centered
+
+      }
+    }
+   
+    # Global AR(1) effect for beta1
+   
+    beta1[1] ~ dnorm(0, (1 - rho_beta1^2) * tau_beta1)
+    for(i in 2:N_years){
+      beta1[i] ~ dnorm(rho_beta1 * beta1[i-1], tau_beta1)
+    }
+   
+    # Global AR(1) effect for beta2
+   
+    beta2[1] ~ dnorm(0, (1 - rho_beta2^2) * tau_beta2)
+    for(i in 2:N_years){
+      beta2[i] ~ dnorm( rho_beta2 * beta2[i-1], tau_beta2)
+    }
+       
+    # Serotype-specific AR(1) effect
+    for(j in 1:N_sts){
+      epsilon1[1,j] ~ dnorm(0, (1 - rho_eps^2) * tau_eps)
+     
+      for(i in 2:N_years){
+        epsilon1[i,j] ~ dnorm(0, tau_eps)
+      }
+    }
+   
+    # Priors for group selection
+    for(j in 1:N_sts){
+      grp[j] ~ dbern(pi[j])  # Group assignment - 0 or 1
+      pi[j] ~ dunif(0,1)
+    }
+       
+    # Priors
+    alpha1 ~ dnorm(0, 1e-4)
+    tau_global ~ dgamma(0.01, 0.01)
+
+    rho_beta1 ~ dunif(-1, 1)   # Uniform prior for rho_beta1 -- global AR(1) for beta1
+    rho_beta2 ~ dunif(-1, 1)   # Uniform prior for rho_beta2 -- global AR(1) for beta2
+    rho_eps ~ dunif(-1, 1)     # Prior for rho_eps same for all STs
+   
+    tau_beta1 ~ dgamma(3, 2)   # Tight prior for tau for beta1
+    tau_beta2 ~ dgamma(3, 2)   # Tight prior for tau for beta2
+    tau_eps ~ dgamma(3, 2)     # Tight prior for tau, shared for all serotypes
+   
+    for(j in 1:N_sts){
+      delta1[j] ~ dnorm(0, tau_global)  # Serotype means centered around 0
+      r[j] ~ dunif(0, 250)  # Serotype dispersion parameter
+    }
+  }
+"
+```
+
+### Create JAGS model object
+
+```{r, eval = FALSE}
+mod16 <- jags.model(textConnection(mod15_string),
+                   data = list("N_IPD" = mod14_mat,
+                               "N_years" = max(mod14_df$year_n),
+                               "N_sts" = ncol(mod14_mat)),
+                   inits = list(inits1, inits2, inits3),
+                   n.adapt = 10000,
+                   n.chains = 3)
+```
+
+### Sample posteriors
+
+```{r, eval = FALSE}
+params16 <- c("alpha1", "epsilon1", "delta1", "beta1", "beta2", "tau_beta1", "tau_beta2", "lambda", "rho_beta1", "rho_beta2", "rho_eps", "pi", "grp", "r", "tau_global", "tau_eps", "prob", "N_IPD")
+
+mod16_postsamp <- coda.samples(mod16, params16, n.iter = 50000)
+
+# save(mod16_postsamp, file = "data/interim/mod16_postsamp.rda")
+```
+
+```{r, echo = FALSE}
+load("data/interim/mod16_postsamp.rda")
+```
+
+### Plot traces for alpha1 + delta[j] + grp[j]\*(beta1[i] ) + (1-grp[j])\*(beta2[i]) ¡ epsilon1 {.tabset}
+
+```{r, echo = FALSE}
+grp_samples3 <- mod16_postsamp[, grep("^grp\\[", varnames(mod16_postsamp), value = TRUE)]
+alpha1_samples3 <- mod16_postsamp[, "alpha1"]
+delta1_samples3 <- mod16_postsamp[, grep("^delta1\\[", varnames(mod16_postsamp), value = TRUE)]
+beta1_samples3 <- mod16_postsamp[, grep("^beta1\\[", varnames(mod16_postsamp), value = TRUE)]
+beta2_samples3 <- mod16_postsamp[, grep("^beta2\\[", varnames(mod16_postsamp), value = TRUE)]
+epsilon2_samples3 <- mod16_postsamp[, grep("^epsilon1\\[", varnames(mod16_postsamp), value = TRUE)]
+
+N_years <- ncol(beta1_samples[[1]])
+N_sts <- ncol(delta1_samples[[1]])
+
+combined_effect16a <- list()
+
+combined_effect16c <- list()
+```
+
+```{r, results = 'asis', echo = FALSE}
+for (i in 1:N_years) {
+  
+  cat(paste0("\n#### ", year_mapping14[i], " {.tabset}", "\n"))
+  cat("\n")
+  
+  for (j in 1:N_sts) {
+    for (chain in 1:3) { 
+      combined_effect16c[[chain]] <- alpha1_samples3[[chain]] + 
+        delta1_samples3[[chain]][, j] + 
+        beta1_samples3[[chain]][, i]*grp_samples3[[chain]][, j] +
+        beta2_samples3[[chain]][, j]*(1-grp_samples3[[chain]][, j]) + 
+        epsilon2_samples3[[chain]][i,j]
+      }
+    
+    combined_mcmc16c <- mcmc.list(combined_effect16c)
+    
+    cat(paste0("\n##### ", st_mapping14[j]," \n"))
+    cat("\n")
+    traceplot(combined_mcmc16c, main = paste("Year", year_mapping14[i], "ST", st_mapping14[j]), 
+              xlab = "Iteration", ylab = "Combined Effect")
+    cat("\n")
+  }
+}
+```
+
+### Compare real vs model-estimated parameters {.tabset}
+
+#### Single params
+
+```{r, echo = FALSE, fig.width = 11, fig.height = 8}
+single_pars3 <- gather_draws(mod16_postsamp, c(alpha1, tau_global, rho_beta1, rho_beta2, rho_eps, tau_beta1, tau_beta2, tau_eps)) |> 
+  median_hdci() |>
+  mutate(obs = case_when(.variable == "alpha1" ~ alpha1,
+                         .variable == "tau_global" ~ tau_global,
+                         .variable == "rho_beta1" ~ rho_beta1,
+                         .variable == "rho_beta2" ~ rho_beta2,
+                         .variable == "rho_eps" ~ rho_eps,
+                         .variable == "tau_beta1" ~ tau_beta1,
+                         .variable == "tau_beta2" ~ tau_beta2,
+                         .variable == "tau_eps" ~ tau_eps))
+
+single_pars3 |> 
+  ggplot(aes(x = 1)) +
+  geom_pointrange(aes(ymin = .lower, ymax = .upper, y = .value, color = "Estimated")) +
+  geom_point(aes(y = obs, color = "Real")) +
+  labs(x = "", y = "", color = "") +
+  facet_wrap(~.variable, scales = "free_y") +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+```
+
+#### delta1
+
+```{r, echo = FALSE}
+delta_est3 <- gather_draws(mod16_postsamp, delta1[j]) |> 
+  median_hdci() |> 
+  rename(st = j) |> 
+  mutate(obs = delta1)
+
+delta_est3 |> 
+  ggplot(aes(x = st)) +
+  geom_pointrange(aes(ymin = .lower, ymax = .upper, y = .value, color = "Estimated")) +
+  geom_point(aes(y = obs, color = "Real")) +
+  labs(x = "Serotype", y = "", color = "", title = "delta1 (serotype intercept)") +
+  theme_bw() +
+  scale_x_continuous(breaks = c(1:13))
+```
+
+```{r, echo = FALSE, eval = FALSE}
+r_est3 <- gather_draws(mod16_postsamp, r[j]) |> 
+  median_hdci() |> 
+  rename(st = j) |> 
+  mutate(obs = r)
+
+r_est3 |> 
+  ggplot(aes(x = st)) +
+  geom_pointrange(aes(ymin = .lower, ymax = .upper, y = .value, color = "Estimated")) +
+  geom_point(aes(y = obs, color = "Real")) +
+  labs(x = "Serotype", y = "", color = "", title = "r") +
+  theme_bw() +
+  scale_x_continuous(breaks = c(1:13))
+```
+
+#### grp
+
+```{r, echo = FALSE}
+grp_est3 <- gather_draws(mod16_postsamp, grp[j]) |> 
+  median_hdci() |> 
+  rename(st = j) |> 
+  mutate(obs = grp,
+         obs = if_else(grp == 0, 1, 0))
+
+grp_est3 |> 
+  ggplot(aes(x = st)) +
+  geom_pointrange(aes(ymin = .lower, ymax = .upper, y = .value, color = "Estimated"), size = 1.1) +
+  geom_point(aes(y = obs, color = "Real")) +
+  labs(x = "Serotype", y = "", color = "", title = "AR1 group assignment") +
+  theme_bw() +
+  scale_x_continuous(breaks = c(1:13))
+```
+
+#### beta1
+
+```{r, echo = FALSE}
+beta1_est3 <- gather_draws(mod16_postsamp, beta1[i]) |> 
+  median_hdci() |> 
+  rename(year = i) |> 
+  mutate(obs = beta1)
+
+beta1_est3 |> 
+  ggplot(aes(x = year)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper, fill = "Estimated"), alpha = 0.3, show.legend = FALSE) +
+  geom_line(aes(y = .value, color = "Estimated")) +
+  geom_line(aes(y = obs, color = "Real")) +
+  labs(x = "Year", y = "", color = "", title = "beta1 (global AR1)") +
+  theme_bw()
+```
+
+#### beta2
+
+```{r, echo = FALSE}
+beta2_est3 <- gather_draws(mod16_postsamp, beta2[i]) |> 
+  median_hdci() |> 
+  rename(year = i) |> 
+  mutate(obs = beta2)
+
+beta2_est3 |> 
+  ggplot(aes(x = year)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper, fill = "Estimated"), alpha = 0.3, show.legend = FALSE) +
+  geom_line(aes(y = .value, color = "Estimated")) +
+  geom_line(aes(y = obs, color = "Real")) +
+  labs(x = "Year", y = "", color = "", title = "beta2 (global AR1)") +
+  theme_bw()
+```
+
+#### epsilon1
+
+```{r, echo = FALSE, fig.width = 11, fig.height = 8}
+epsilon_est3 <- gather_draws(mod16_postsamp, epsilon1[i,j]) |> 
+  median_hdci() |> 
+  rename(st = j,
+         year = i) |> 
+  left_join(data.frame(epsilon1) |> 
+              rownames_to_column("year") |> 
+              pivot_longer(cols = c(2:14), names_to = "st", values_to = "obs", names_prefix = "X") |> 
+              mutate(year = as.numeric(year),
+                     st = as.numeric(st)), 
+            by = c("year", "st"))
+
+epsilon_est3 |> 
+  ggplot(aes(x = year)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper, fill = "Estimated"), alpha = 0.3, show.legend = FALSE) +
+  geom_line(aes(y = .value, color = "Estimated")) +
+  geom_line(aes(y = obs, color = "Real")) +
+  labs(x = "Year", y = "", color = "", title = "epsilon1 (serotype-specific AR1)") +
+  facet_wrap(~st) +
+  theme_bw()
+```
+
+#### lambda
+
+```{r, echo = FALSE, fig.width = 11, fig.height = 8}
+lambda_est3 <- gather_draws(mod16_postsamp, lambda[i,j]) |> 
+  median_hdci() |> 
+  rename(st = j,
+         year = i) |> 
+  left_join(data.frame(lambda) |> 
+              rownames_to_column("year") |> 
+              pivot_longer(cols = c(2:14), names_to = "st", values_to = "obs", names_prefix = "X") |> 
+              mutate(year = as.numeric(year),
+                     st = as.numeric(st)), 
+            by = c("year", "st"))
+
+lambda_est3 |> 
+  ggplot(aes(x = year)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper, fill = "Estimated"), alpha = 0.3, show.legend = FALSE) +
+  geom_line(aes(y = .value, color = "Estimated")) +
+  geom_line(aes(y = obs, color = "Real"), lty = 2) +
+  labs(x = "Year", y = "", color = "", title = "lambda (# cases)") +
+  facet_wrap(~st, scales = "free_y") +
+  theme_bw()
+```
+
+
+## Create simulated dataset 2
+
+```{r}
+set.seed(102)
+
+# Priors
+pi2 <- 0.5
+alpha12 <- 3 # global intercept
+tau_global2 <- 0.7 # st-specific variance
+
+rho_beta12 <- 0.9 # autocorrelation for beta1
+rho_beta22 <- 0.9 # autocorrelation for beta2
+rho_eps2 <- 0.9 # autocorrelation for st-specific ar1s
+
+tau_beta12 <- 0.03 # variance for beta1
+tau_beta22 <- 0.02 # variance for beta2
+tau_eps2 <- 0.01 # variance for st-specific ar1s
+
+delta12 <- numeric(N_sts)
+r2 <- numeric(N_sts)
+grp2 <- numeric(N_sts)
+
+for(j in 1:N_sts){
+  delta12[j] <- 4
+  r2[j] <- runif(1, 0, 250)  # Serotype dispersion parameter
+  grp2[j] <- rbinom(1, 1, pi)
+}
+
+# Serotype-specific AR(1)
+epsilon12 <- matrix(nrow = N_years, ncol = N_sts)
+
+for(j in 1:N_sts){
+  epsilon12[1,j] <- rnorm(1, 0, (1 - rho_eps2^2) * tau_eps2)
+  
+  for(i in 2:N_years){
+    epsilon12[i,j] <- rnorm(1, rho_eps2 * epsilon12[i-1, j], tau_eps2)
+  }
+}
+
+# Global AR(1) - beta 1
+
+beta12 <- numeric(N_years)
+
+beta12[1] <- 0.2
+for(i in 2:N_years){
+  beta12[i] <- rnorm(1, rho_beta12 * beta12[i-1], tau_beta12)
+}
+
+# Global AR(1) - beta2
+
+beta22 <- numeric(N_years)
+
+beta22[1] <- 6
+for(i in 2:N_years){
+  beta22[i] <- rnorm(1, rho_beta22 * beta22[i-1], tau_beta22)
+}
+
+# Case counts
+
+lambda2 <- matrix(nrow = N_years, ncol = N_sts)
+prob2 <- matrix(nrow = N_years, ncol = N_sts)
+N_IPD2 <- matrix(nrow = N_years, ncol = N_sts)
+
+for(i in 1:N_years){
+  
+  for(j in 1:N_sts){
+    lambda2[i,j] <- exp(alpha12 + delta12[j] + epsilon12[i,j] + grp2[j]*beta12[i] + ((1-grp2[j])*beta22[i]))
+    
+    N_IPD2[i,j] <- rpois(n = 1, lambda = lambda2[i,j])
+    
+    }
+}
+
+pre_simulated_data2 <- data.frame(N_IPD2)
+colnames(pre_simulated_data2) <- 1:N_sts
+rownames(pre_simulated_data2) <- 1:N_years
+
+simulated_data2 <- pre_simulated_data2 |>
+  rownames_to_column("year") |>
+  pivot_longer(cols = 2:14, names_to = "st", values_to = "N_IPD") |>
+  mutate(year = as.numeric(year),
+         N_IPD = as.numeric(N_IPD),
+         group = rep(grp, N_years),
+         st = as.numeric(st))
+```
+
+```{r, echo = FALSE, fig.width = 11}
+# simulated_data2 |> 
+#   dplyr::select(group, st) |> 
+#   distinct() |> 
+#   mutate(group = if_else(group < 0.5, "Group 1 (beta1)", "Group 2 (beta2)")) |> 
+#   group_by(group) |> 
+#   summarise(serotypes = paste0(st, collapse = " ,"))
+
+simulated_data2 |> 
+  ggplot(aes(x = year, y = N_IPD, color = as.factor(st))) +
+  geom_line() +
+  labs(color = "serotype") +
+  facet_wrap(group~.) +
+  theme_bw()
+
+g02 <- simulated_data2 |> 
+  filter(group == 0) |> 
+  ggplot(aes(x = year, y = N_IPD, color = as.factor(st))) +
+  geom_line(show.legend = FALSE) +
+  labs(color = "serotype", title = "Group = 0") +
+  facet_wrap(~st, scales = "free_y") +
+  theme_bw()
+
+g12 <- simulated_data2 |> 
+  filter(group == 1) |> 
+  ggplot(aes(x = year, y = N_IPD, color = as.factor(st))) +
+  geom_line(show.legend = FALSE) +
+  labs(color = "serotype", title = "Group = 1") +
+  facet_wrap(~st, scales = "free_y") +
+  theme_bw()
+
+gridExtra::grid.arrange(g02, g12, ncol = 2)
+```
+
+```{r, echo = FALSE}
+mod15_df <- simulated_data2 |> 
+  ungroup() |> 
+  complete(st, year, fill = list(N_IPD = 0))  |> 
+  arrange(st, year) |> 
+  group_by(st) |> 
+  arrange(year) |> 
+  mutate(year_n = row_number()) |> 
+  ungroup()
+
+mod15_mat <- mod15_df |> 
+  reshape2::dcast(year ~ st, value.var = 'N_IPD') |> 
+  dplyr::select(-year)
+
+st_mapping15 <- setNames(colnames(mod15_mat), 1:length(unique(mod15_df$st)))
+year_mapping15 <- setNames(unique(mod15_df$year), 1:length(unique(mod15_df$year)))
+```
+
+### Define model string
+
+```{r}
+mod15_string <- "
+  model {
+   
+    for(i in 1:N_years){
+     
+      for(j in 1:N_sts){
+        N_IPD[i,j] ~ dnegbin(prob[i,j], r[j])
+       
+        prob[i,j] <- r[j] / (r[j] + lambda[i,j])  # Likelihood
+       
+        log(lambda[i,j]) <- alpha1 + # Global intercept
+                            delta1[j] + # Serotype intercept
+                            epsilon1[i,j] + # Serotype-specific AR(1), 0 centered
+                            grp[j]*(beta1[i]) + (1-grp[j])*(beta2[i]) # Global AR(1) version 1 or 2, 0 centered
+
+      }
+    }
+   
+    # Global AR(1) effect for beta1
+   
+    beta1[1] ~ dnorm(0, (1 - rho_beta1^2) * tau_beta1)
+    for(i in 2:N_years){
+      beta1[i] ~ dnorm(rho_beta1 * beta1[i-1], tau_beta1)
+    }
+   
+    # Global AR(1) effect for beta2
+   
+    beta2[1] ~ dnorm(0, (1 - rho_beta2^2) * tau_beta2)
+    for(i in 2:N_years){
+      beta2[i] ~ dnorm( rho_beta2 * beta2[i-1], tau_beta2)
+    }
+       
+    # Serotype-specific AR(1) effect
+    for(j in 1:N_sts){
+      epsilon1[1,j] ~ dnorm(0, (1 - rho_eps^2) * tau_eps)
+     
+      for(i in 2:N_years){
+        epsilon1[i,j] ~ dnorm(0, tau_eps)
+      }
+    }
+   
+    # Priors for group selection
+    for(j in 1:N_sts){
+      grp[j] ~ dbern(pi)  # Group assignment - 0 or 1
+    }
+   
+    pi ~ dunif(0,1)
+       
+    # Priors
+    alpha1 ~ dnorm(0, 1e-4)
+    tau_global ~ dgamma(0.01, 0.01)
+
+    rho_beta1 ~ dunif(-1, 1)   # Uniform prior for rho_beta1 -- global AR(1) for beta1
+    rho_beta2 ~ dunif(-1, 1)   # Uniform prior for rho_beta2 -- global AR(1) for beta2
+    rho_eps ~ dunif(-1, 1)     # Prior for rho_eps same for all STs
+   
+    tau_beta1 ~ dgamma(3, 2)   # Tight prior for tau for beta1
+    tau_beta2 ~ dgamma(3, 2)   # Tight prior for tau for beta2
+    tau_eps ~ dgamma(3, 2)     # Tight prior for tau, shared for all serotypes
+   
+    for(j in 1:N_sts){
+      delta1[j] ~ dnorm(0, tau_global)  # Serotype means centered around 0
+      r[j] ~ dunif(0, 250)  # Serotype dispersion parameter
+    }
+  }
+"
+```
+
+### Create JAGS model object
+
+```{r, eval = FALSE}
+mod15 <- jags.model(textConnection(mod15_string),
+                   data = list("N_IPD" = mod15_mat,
+                               "N_years" = max(mod15_df$year_n),
+                               "N_sts" = ncol(mod15_mat)),
+                   inits = list(inits1, inits2, inits3),
+                   n.adapt = 10000,
+                   n.chains = 3)
+```
+
+### Sample posteriors
+
+```{r, eval = FALSE}
+params15 <- c("alpha1", "epsilon1", "delta1", "beta1", "beta2", "tau_beta1", "tau_beta2", "lambda", "rho_beta1", "rho_beta2", "rho_eps", "pi", "grp", "r", "tau_global", "tau_eps", "prob", "N_IPD")
+
+mod15_postsamp <- coda.samples(mod15, params15, n.iter = 10000)
+
+# save(mod15_postsamp, file = "data/interim/mod15_postsamp.rda")
+```
+
+```{r, echo = FALSE}
+load("data/interim/mod15_postsamp.rda")
+```
+
+### Plot traces for alpha1 + delta[j] + grp[j]\*(beta1[i] ) + (1-grp[j])\*(beta2[i]) {.tabset}
+
+```{r, echo = FALSE}
+grp_samples2 <- mod15_postsamp[, grep("^grp\\[", varnames(mod15_postsamp), value = TRUE)]
+
+alpha1_samples2 <- mod15_postsamp[, "alpha1"]
+delta1_samples2 <- mod15_postsamp[, grep("^delta1\\[", varnames(mod15_postsamp), value = TRUE)]
+beta1_samples2 <- mod15_postsamp[, grep("^beta1\\[", varnames(mod15_postsamp), value = TRUE)]
+beta2_samples2 <- mod15_postsamp[, grep("^beta2\\[", varnames(mod15_postsamp), value = TRUE)]
+
+N_years2 <- ncol(beta1_samples2[[1]])
+N_sts2 <- ncol(delta1_samples2[[1]])
+
+combined_effect15c <- list()
+```
+
+```{r, results = 'asis', echo = FALSE}
+for (i in 1:N_years) {
+  
+  cat(paste0("\n#### ", year_mapping15[i], " {.tabset}", "\n"))
+  cat("\n")
+  
+  for (j in 1:N_sts) {
+    for (chain in 1:3) { 
+      combined_effect15c[[chain]] <- alpha1_samples2[[chain]] + 
+        delta1_samples2[[chain]][, j] + 
+        beta1_samples2[[chain]][, i]*grp_samples[[chain]][, j] +
+        beta2_samples2[[chain]][, j]*(1-grp_samples2[[chain]][, j])
+      }
+    
+    combined_mcmc15c <- mcmc.list(combined_effect15c)
+    
+    cat(paste0("\n##### ", st_mapping15[j]," \n"))
+    cat("\n")
+    traceplot(combined_mcmc15c, main = paste("Year", year_mapping15[i], "ST", st_mapping15[j]), 
+              xlab = "Iteration", ylab = "Combined Effect")
+    cat("\n")
+  }
+}
+```
+
+### Compare real vs model-estimated parameters {.tabset}
+
+#### Single params
+
+```{r, echo = FALSE, fig.width = 11, fig.height = 8}
+single_pars2 <- gather_draws(mod15_postsamp, c(pi, alpha1, tau_global, rho_beta1, rho_beta2, rho_eps, tau_beta1, tau_beta2, tau_eps)) |> 
+  median_hdci() |>
+  mutate(obs = case_when(.variable == "pi" ~ pi2,
+                         .variable == "alpha1" ~ alpha12,
+                         .variable == "tau_global" ~ tau_global2,
+                         .variable == "rho_beta1" ~ rho_beta12,
+                         .variable == "rho_beta2" ~ rho_beta22,
+                         .variable == "rho_eps" ~ rho_eps2,
+                         .variable == "tau_beta1" ~ tau_beta12,
+                         .variable == "tau_beta2" ~ tau_beta22,
+                         .variable == "tau_eps" ~ tau_eps2))
+
+single_pars2 |> 
+  ggplot(aes(x = 1)) +
+  geom_pointrange(aes(ymin = .lower, ymax = .upper, y = .value, color = "Estimated")) +
+  geom_point(aes(y = obs, color = "Real")) +
+  labs(x = "", y = "", color = "") +
+  facet_wrap(~.variable, scales = "free_y") +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+```
+
+#### delta1
+
+```{r, echo = FALSE}
+delta_est2 <- gather_draws(mod15_postsamp, delta1[j]) |> 
+  median_hdci() |> 
+  rename(st = j) |> 
+  mutate(obs = delta12)
+
+delta_est2 |> 
+  ggplot(aes(x = st)) +
+  geom_pointrange(aes(ymin = .lower, ymax = .upper, y = .value, color = "Estimated")) +
+  geom_point(aes(y = obs, color = "Real")) +
+  labs(x = "Serotype", y = "", color = "", title = "delta1 (serotype intercept)") +
+  theme_bw() +
+  scale_x_continuous(breaks = c(1:13))
+```
+
+```{r, echo = FALSE, eval = FALSE}
+r_est2 <- gather_draws(mod15_postsamp, r[j]) |> 
+  median_hdci() |> 
+  rename(st = j) |> 
+  mutate(obs = r2)
+
+r_est2 |> 
+  ggplot(aes(x = st)) +
+  geom_pointrange(aes(ymin = .lower, ymax = .upper, y = .value, color = "Estimated")) +
+  geom_point(aes(y = obs, color = "Real")) +
+  labs(x = "Serotype", y = "", color = "", title = "r") +
+  theme_bw() +
+  scale_x_continuous(breaks = c(1:13))
+```
+
+#### grp
+
+```{r, echo = FALSE}
+grp_est2 <- gather_draws(mod15_postsamp, grp[j]) |> 
+  median_hdci() |> 
+  rename(st = j) |> 
+  mutate(obs = grp2)
+
+grp_est2 |> 
+  ggplot(aes(x = st)) +
+  geom_pointrange(aes(ymin = .lower, ymax = .upper, y = .value, color = "Estimated"), size = 1.1) +
+  geom_point(aes(y = obs, color = "Real")) +
+  labs(x = "Serotype", y = "", color = "", title = "AR1 group assignment") +
+  theme_bw() +
+  scale_x_continuous(breaks = c(1:13))
+```
+
+#### beta1
+
+```{r, echo = FALSE}
+beta1_est2 <- gather_draws(mod15_postsamp, beta1[i]) |> 
+  median_hdci() |> 
+  rename(year = i) |> 
+  mutate(obs = beta12)
+
+beta1_est2 |> 
+  ggplot(aes(x = year)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper, fill = "Estimated"), alpha = 0.3, show.legend = FALSE) +
+  geom_line(aes(y = .value, color = "Estimated")) +
+  geom_line(aes(y = obs, color = "Real")) +
+  labs(x = "Year", y = "", color = "", title = "beta1 (global AR1)") +
+  theme_bw()
+```
+
+#### beta2
+
+```{r, echo = FALSE}
+beta2_est2 <- gather_draws(mod15_postsamp, beta2[i]) |> 
+  median_hdci() |> 
+  rename(year = i) |> 
+  mutate(obs = beta22)
+
+beta2_est2 |> 
+  ggplot(aes(x = year)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper, fill = "Estimated"), alpha = 0.3, show.legend = FALSE) +
+  geom_line(aes(y = .value, color = "Estimated")) +
+  geom_line(aes(y = obs, color = "Real")) +
+  labs(x = "Year", y = "", color = "", title = "beta2 (global AR1)") +
+  theme_bw()
+```
+
+#### epsilon1
+
+```{r, echo = FALSE, fig.width = 11, fig.height = 8}
+epsilon_est2 <- gather_draws(mod15_postsamp, epsilon1[i,j]) |> 
+  median_hdci() |> 
+  rename(st = j,
+         year = i) |> 
+  left_join(data.frame(epsilon12) |> 
+              rownames_to_column("year") |> 
+              pivot_longer(cols = c(2:14), names_to = "st", values_to = "obs", names_prefix = "X") |> 
+              mutate(year = as.numeric(year),
+                     st = as.numeric(st)), 
+            by = c("year", "st"))
+
+epsilon_est |> 
+  ggplot(aes(x = year)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper, fill = "Estimated"), alpha = 0.3, show.legend = FALSE) +
+  geom_line(aes(y = .value, color = "Estimated")) +
+  geom_line(aes(y = obs, color = "Real")) +
+  labs(x = "Year", y = "", color = "", title = "epsilon1 (serotype-specific AR1)") +
+  facet_wrap(~st) +
+  theme_bw()
+```
+
+#### lambda
+
+```{r, echo = FALSE, fig.width = 11, fig.height = 8}
+lambda_est2 <- gather_draws(mod15_postsamp, lambda[i,j]) |> 
+  median_hdci() |> 
+  rename(st = j,
+         year = i) |> 
+  left_join(data.frame(lambda2) |> 
+              rownames_to_column("year") |> 
+              pivot_longer(cols = c(2:14), names_to = "st", values_to = "obs", names_prefix = "X") |> 
+              mutate(year = as.numeric(year),
+                     st = as.numeric(st)), 
+            by = c("year", "st"))
+
+lambda_est2 |> 
+  ggplot(aes(x = year)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper, fill = "Estimated"), alpha = 0.3, show.legend = FALSE) +
+  geom_line(aes(y = .value, color = "Estimated")) +
+  geom_line(aes(y = obs, color = "Real"), lty = 2) +
+  labs(x = "Year", y = "", color = "", title = "lambda (# cases)") +
+  facet_wrap(~st, scales = "free_y") +
+  theme_bw()
+```

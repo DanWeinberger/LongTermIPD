@@ -1,0 +1,309 @@
+---
+title: "DTW Clustering"
+author: "Paloma Cárcamo"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, dtwclust, ggdendro, plotly, mgcv)
+```
+
+```{r, echo = FALSE}
+pcv7_st <- c("4","6B","9V","14","18C","19F","23F")
+pcv13_st <- c("1","3","4","5","6A","6B","7F","9V","14","18C","19A","19F","23F")
+pcv15_st <- c("1","3","4","5","6A","6B","7F","9V","14","18C","19A","19F","22F","23F","33F")
+pcv20_st <- c("1","3","4","5","6A","6B","7F","8","9V","10A","11A","12F","14","15B","18C","19A","19F","22F","23F","33F")
+
+data_raw <- read_rds("data/ABCs_st_1998_2021.rds")
+
+data <- data_raw |> 
+  rename(agec = "Age.Group..years.",
+         year = Year,
+         st = IPD.Serotype,
+         N_IPD = Frequency.Count)  |> 
+  mutate(st = if_else(st == '16', '16F', st))  |> 
+  group_by(st, year) |> 
+  summarize(N_IPD = sum(N_IPD))  |> 
+  ungroup() |> 
+  complete(year, st, fill = list(N_IPD = 0)) |> 
+  mutate(pcv7 = if_else(st %in% pcv7_st, 1, 0),
+         pcv13 = if_else(st %in% pcv13_st, 1, 0),
+         pcv15 = if_else(st %in% pcv15_st, 1, 0),
+         pcv20 = if_else(st %in% pcv20_st, 1, 0),
+         firstvax = case_when(pcv7 == 1 ~ "pcv7",
+                              pcv13 == 1 ~ "pcv13",
+                              pcv15 == 1 ~ "pcv15",
+                              pcv20 == 1 ~ "pcv20",
+                              .default = "")) |> 
+  filter(st != "MISS" & st != "NT") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number()) |> 
+  ungroup() |> 
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+```
+
+### Smooth with p-splines
+
+```{r}
+gmods <- list()
+
+for (i in names(data)) {
+  gmods[[i]] <- tryCatch(
+    {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 25),
+                    family = poisson,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = data[[i]]),
+        success = 1
+      )
+    },
+    warning = function(w) {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 25),
+                    family = poisson,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = data[[i]]),
+        success = 0
+      )
+    }
+  )
+}
+
+smooth_data <- list()
+
+for (i in names(data)){
+  smooth_data[[i]] = data.frame(fitcases = gmods[[i]]$model$fitted.values) %>% 
+    dplyr::mutate(nyear = seq.int(from = 1, by = 1, length.out = n()),
+                  success = gmods[[i]]$success)
+}
+
+smooth_data |> 
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  select(name, success) |> 
+  distinct() |> 
+  filter(success == 0)
+
+# No gam convergence for 12B, 15D, 16A, 18, 19B, 19C, 25F, 33B, 35, 41A, 43, 45, 47F
+
+ts_data <- smooth_data |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+ts_labels <- tibble(name = names(ts_data),
+                    group = 1:length(ts_data))
+```
+
+### Determine window and cluster size
+
+```{r, echo = FALSE, eval = FALSE}
+cfg <- dtwclust::compare_clusterings_configs(
+  types = "hierarchical", 
+  k = 2L:71L, 
+  controls = list(hierarchical = hierarchical_control(method = "average")), 
+  distances = pdc_configs("distance", hierarchical = list(dtw = list(window.size = seq(from = 1L, to = 25L, by = 1L), norm = c("L1")))),
+  centroids = pdc_configs("centroid", hierarchical = list(dba = list(window.size = seq(from = 1L, to = 25L, by = 1L), norm = c("L1")))),
+  preprocs = pdc_configs("preproc", hierarchical = list(zscore = list(window.size = seq(from = 1L, to = 25L, by = 1L), norm = c("L1")))),
+  no.expand = c("window.size", "norm" ))
+
+evaluators <- cvi_evaluators(c("DBstar"))
+
+comparison <- compare_clusterings(ts_data, 
+                                  types = "hierarchical", 
+                                  configs = cfg, 
+                                  seed = 8L, 
+                                  score.clus = evaluators$score, 
+                                  pick.clus = evaluators$pick)
+
+result <- comparison$results$hierarchical |> 
+  arrange(DBstar)
+
+```
+
+### DTW clustering - 2 clusters 
+
+```{r, fig.width = 15, fig.height = 7}
+dtw_hc <- dtwclust::tsclust(ts_data,
+                            type = "hierarchical",
+                            k = 2,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE)
+
+hc_members <- as.data.frame((ggplot_build(plot(dtw_hc, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(ts_labels, by = "group")
+hc_centroid <- as.data.frame((ggplot_build(plot(dtw_hc, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs <- label(dendro_data(as.dendrogram(dtw_hc))) |> 
+  left_join(hc_members |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_hc) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+### DTW clustering - 2 clusters with wider window
+
+```{r}
+dtw_hc <- dtwclust::tsclust(ts_data,
+                            type = "hierarchical",
+                            k = 2,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 71L), cent = dba))
+
+hc_members <- as.data.frame((ggplot_build(plot(dtw_hc, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(ts_labels, by = "group")
+hc_centroid <- as.data.frame((ggplot_build(plot(dtw_hc, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs <- label(dendro_data(as.dendrogram(dtw_hc))) |> 
+  left_join(hc_members |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_hc) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+### DTW clustering - 3 clusters
+
+```{r}
+dtw_hc3 <- dtwclust::tsclust(ts_data,
+                            type = "hierarchical",
+                            k = 3,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE)
+
+hc_members3 <- as.data.frame((ggplot_build(plot(dtw_hc3, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(ts_labels, by = "group")
+hc_centroid3 <- as.data.frame((ggplot_build(plot(dtw_hc3, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs3 <- label(dendro_data(as.dendrogram(dtw_hc3))) |> 
+  left_join(hc_members3 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members3 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_hc3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs3, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+### DTW clustering - 5 clusters
+
+```{r, fig.width = 17, fig.height = 7}
+dtw_hc5 <- dtwclust::tsclust(ts_data,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE)
+
+hc_members5 <- as.data.frame((ggplot_build(plot(dtw_hc5, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(ts_labels, by = "group")
+hc_centroid5 <- as.data.frame((ggplot_build(plot(dtw_hc5, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs5 <- label(dendro_data(as.dendrogram(dtw_hc5))) |> 
+  left_join(hc_members5 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members5 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_hc5) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs5, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+### DTW clustering - 10 clusters
+
+```{r, fig.width = 17, fig.height = 7}
+dtw_hc10 <- dtwclust::tsclust(ts_data,
+                            type = "hierarchical",
+                            k = 10,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE)
+
+hc_members10 <- as.data.frame((ggplot_build(plot(dtw_hc10, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(ts_labels, by = "group")
+hc_centroid10 <- as.data.frame((ggplot_build(plot(dtw_hc10, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs10 <- label(dendro_data(as.dendrogram(dtw_hc10))) |> 
+  left_join(hc_members10 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members10 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_hc10) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs10, aes(x = x, y = 0, colour = Cluster), size = 4)
+```

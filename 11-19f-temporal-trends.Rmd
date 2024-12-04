@@ -1,0 +1,206 @@
+---
+title: "19F temporal trends"
+author: "Paloma Cárcamo"
+date: "2024-10-17"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, reactable)
+```
+
+```{r, message = FALSE}
+us_raw <- read_rds("data/ABCs_st_1998_2021.rds")
+
+us <- us_raw |> 
+  rename(agec = "Age.Group..years.",
+         year = Year,
+         st = IPD.Serotype,
+         N_IPD = Frequency.Count)  |> 
+  mutate(st = if_else(st == '16', '16F', st))  |> 
+  group_by(st, year) |> 
+  summarize(N_IPD = sum(N_IPD)) |> 
+  group_by(year) |> 
+  mutate(IPD_total = sum(N_IPD)) |> 
+  ungroup() |> 
+  filter(st == "19F") |> 
+  rename(IPD_19F = N_IPD) |> 
+  mutate(country = "United States",
+         prop_19F = IPD_19F/IPD_total) |> 
+  dplyr::select(country, year, IPD_19F, IPD_total, prop_19F)
+
+aus_raw <- readxl::read_xlsx("data/aus_ipd.xlsx", skip = 1)
+
+aus <- aus_raw |> 
+  rename(year = Year,
+         st = Serotype)  |> 
+  group_by(year, st) |> 
+  summarise(N_IPD = n()) |> 
+  group_by(year) |> 
+  mutate(IPD_total = sum(N_IPD)) |> 
+  ungroup() |> 
+  filter(st == "19F") |> 
+  rename(IPD_19F = N_IPD) |> 
+  mutate(country = "Australia",
+         prop_19F = IPD_19F/IPD_total) |> 
+  dplyr::select(country, year, IPD_19F, IPD_total, prop_19F)
+
+eur_raw <- read_csv("data/ecdc_processed.csv", col_select = -1)
+
+eur <- eur_raw |> 
+  group_by(country, year, st) |> 
+  summarise(N_IPD = sum(total_cases, na.rm = TRUE))|> 
+  group_by(country, year) |> 
+  mutate(IPD_total = sum(N_IPD)) |> 
+  ungroup() |> 
+  filter(st == "19F") |> 
+  dplyr::select(-st) |> 
+  rename(IPD_19F = N_IPD) |> 
+  mutate(prop_19F = IPD_19F/IPD_total)
+
+ger_ipd_raw <- read_csv("data/DE_IPD_deidentified.csv")
+
+ger <- ger_ipd_raw |> 
+  mutate(date = as.Date(DateOfIsolation, format = "%d/%m/%Y"),
+         year = year(date)) |>
+  rename(st = Serotype) |> 
+  group_by(year, st) |> 
+  summarise(N_IPD = n()) |> 
+  group_by(year) |> 
+  mutate(IPD_total = sum(N_IPD)) |> 
+  ungroup() |> 
+  filter(st == "19F" & !is.na(year)) |> 
+  rename(IPD_19F = N_IPD) |> 
+  mutate(country = "Germany",
+         prop_19F = IPD_19F/IPD_total) |> 
+  dplyr::select(country, year, IPD_19F, IPD_total, prop_19F)
+
+db_19F <- us |> 
+  rbind(aus) |> 
+  rbind(eur) |> 
+  rbind(ger) 
+
+db_19F_wide <- db_19F |> 
+  filter(year >= 2010 & year < 2020) |> 
+  dplyr::select(-IPD_total) |> 
+  pivot_wider(names_from = year, values_from = c(IPD_19F, prop_19F)) |> 
+  rowwise() |> 
+  mutate(baseline = mean(c(IPD_19F_2010, IPD_19F_2011, IPD_19F_2012), na.rm = TRUE),
+         baseline_prop = mean(c(prop_19F_2010, prop_19F_2011, prop_19F_2012), na.rm = TRUE),
+         comparison = if_else(!is.na(IPD_19F_2017), mean(c(IPD_19F_2017, IPD_19F_2018, IPD_19F_2019), na.rm = TRUE), IPD_19F_2014),
+         comparison_prop = if_else(!is.na(prop_19F_2017), mean(c(prop_19F_2017, prop_19F_2018, prop_19F_2019), na.rm = TRUE), prop_19F_2014),
+         ratio_cases = comparison/baseline,
+         ratio_prop = comparison_prop/baseline_prop) |> 
+  ungroup()
+
+data_19F <- read_csv("data/data_19F.csv") |> 
+  left_join(db_19F_wide, by = "country")
+```
+
+```{r}
+reactable(data_19F |> 
+            dplyr::select(country, year_pcv7, year_pcv10, year_pcv13, vax_type, schedule, time_secondvax, mean_cov, baseline, baseline_prop, comparison, comparison_prop, ratio_cases, ratio_prop),
+          columns = list(country = colDef(name = "Country"),
+                         year_pcv7 = colDef(name = "PCV7 introduction"),
+                         year_pcv10 = colDef(name = "PCV10 introduction"),
+                         year_pcv13 = colDef(name = "PCV13 introduction"),
+                         vax_type = colDef(name = "Most used vaccine in F/U period"),
+                         schedule = colDef(name = "Vaccine schedule"),
+                         time_secondvax = colDef(name = "Years between PCV7 and PCV10/13"),
+                         mean_cov = colDef(name = "Vaccine coverage"),
+                         baseline = colDef(name = "19F cases in 2010, 2011 or 2012", format = colFormat(digits = 0)),
+                         baseline_prop = colDef(name = "Proportion 19F cases in 2010, 2011 or 2012", format = colFormat(digits = 2)),
+                         comparison = colDef(name = "Mean yearly 19F cases in 2017:2019", format = colFormat(digits = 2)),
+                         comparison_prop = colDef(name = "Mean yearly proportion 19F cases in 2017:2019", format = colFormat(digits = 2)),
+                         ratio_cases = colDef(name = "Ratio of cases", format = colFormat(digits = 2)),
+                         ratio_prop = colDef(name = "Ratio of proportions", format = colFormat(digits = 2))), defaultPageSize = 14)
+```
+
+```{r, fig.width = 10, fig.height = 5, message = FALSE}
+vax_years <- read_csv("data/vax-intro-years.csv") |> 
+  mutate(label = factor(label, levels = c("PCV7", "PCV10", "PCV13")))
+
+db_19F |> 
+  filter(year >= 2010) |> 
+  ggplot(aes(x = year, y = IPD_19F, color = country)) +
+  geom_line(lwd = 1) +
+  scale_x_continuous(breaks = c(2010:2022)) +
+  labs(x = "", y = "19F IPD cases", color = "") +
+  theme_bw()
+
+db_19F |> 
+  filter(year >= 2010) |> 
+  ggplot(aes(x = year, y = prop_19F, color = country)) +
+  geom_line(lwd = 1) +
+  scale_x_continuous(breaks = c(2010:2022)) +
+  labs(x = "", y = "19F IPD cases/total IPD cases", color = "") +
+  theme_bw()
+
+db_19F |> 
+  filter(year < 2020) |> 
+  ggplot(aes(x = year, y = IPD_19F)) +
+  geom_vline(data = vax_years, aes(xintercept = year, color = label), lty = 2) +
+  scale_color_manual(values = c("PCV7" = "black", "PCV10" = "blue", "PCV13" = "red"), name = "") +
+  ggnewscale::new_scale_color() +
+  geom_line(aes(color = country), lwd = 1, show.legend = FALSE) +
+  scale_x_continuous(breaks = c(2000, 2005, 2010, 2015, 2020)) +
+  facet_wrap(~country, scales = "free_y") +
+  labs(x = "", y = "19F IPD cases", color = "") +
+  theme_bw()
+
+db_19F |> 
+  filter(year < 2020) |> 
+  ggplot(aes(x = year, y = prop_19F)) +
+  geom_vline(data = vax_years, aes(xintercept = year, color = label), lty = 2) +
+  scale_color_manual(values = c("PCV7" = "black", "PCV10" = "blue", "PCV13" = "red"), name = "") +
+  ggnewscale::new_scale_color() +
+  geom_line(aes(color = country), lwd = 1, show.legend = FALSE) +
+  scale_x_continuous(breaks = c(2000, 2005, 2010, 2015, 2020)) +
+  facet_wrap(~country, scales = "free_y") +
+  labs(x = "", y = "19F IPD cases/total IPD cases", color = "") +
+  theme_bw()
+```
+
+```{r}
+# Ratio of cases
+# PCV10 vs PCV13 vs both: not significant
+summary(lm(log(ratio_cases) ~ vax_type, data = data_19F))
+
+# Ratio of proportions
+# PCV10 vs PCV13 vs both: not significant
+summary(lm(log(ratio_prop) ~ vax_type, data = data_19F))
+
+# Ratio of cases
+# Years between PCV7 and PCV10/13: significant, 0.15948
+summary(lm(log(ratio_cases) ~ time_secondvax, data = data_19F))
+
+# Ratio of proportions
+# Years between PCV7 and PCV10/13: significant, 0.16983
+summary(lm(log(ratio_prop) ~ time_secondvax, data = data_19F))
+
+# Ratio of cases
+# Mean vaccine coverage: not significant
+summary(lm(log(ratio_cases) ~ mean_cov, data = data_19F))
+
+# Ratio of proportions
+# Mean vaccine coverage: not significant
+summary(lm(log(ratio_prop) ~ mean_cov, data = data_19F))
+
+# Ratio of cases
+# Vaccination schedule: not significant
+summary(lm(log(ratio_cases) ~ schedule, data = data_19F))
+
+# Ratio of proportions
+# Vaccination schedule: not significant
+summary(lm(log(ratio_prop) ~ schedule, data = data_19F))
+
+# Ratio of cases
+# None significant
+summary(lm(log(ratio_cases) ~ vax_type + time_secondvax + mean_cov + schedule, data = data_19F))
+
+# Ratio of proportions
+# None significant
+summary(lm(log(ratio_prop) ~ vax_type + time_secondvax + mean_cov + schedule, data = data_19F))
+```

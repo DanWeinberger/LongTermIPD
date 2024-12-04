@@ -1,0 +1,2551 @@
+---
+title: "DTW Clustering"
+author: "Paloma Cárcamo"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, dtwclust, ggdendro, plotly, mgcv)
+```
+
+```{r, echo = FALSE}
+pcv7_st <- c("4","6B","9V","14","18C","19F","23F")
+pcv13_st <- c("1","3","4","5","6A","6B","7F","9V","14","18C","19A","19F","23F")
+pcv15_st <- c("1","3","4","5","6A","6B","7F","9V","14","18C","19A","19F","22F","23F","33F")
+pcv20_st <- c("1","3","4","5","6A","6B","7F","8","9V","10A","11A","12F","14","15B","18C","19A","19F","22F","23F","33F")
+```
+
+## United States
+
+```{r, echo = FALSE}
+us_raw <- read_rds("data/ABCs_st_1998_2021.rds")
+
+us <- us_raw |> 
+  rename(agec = "Age.Group..years.",
+         year = Year,
+         st = IPD.Serotype,
+         N_IPD = Frequency.Count)  |> 
+  mutate(st = if_else(st == '16', '16F', st))  |> 
+  group_by(st, year) |> 
+  summarize(N_IPD = sum(N_IPD))  |> 
+  ungroup() |> 
+  complete(year, st, fill = list(N_IPD = 0)) |> 
+  mutate(pcv7 = if_else(st %in% pcv7_st, 1, 0),
+         pcv13 = if_else(st %in% pcv13_st, 1, 0),
+         pcv15 = if_else(st %in% pcv15_st, 1, 0),
+         pcv20 = if_else(st %in% pcv20_st, 1, 0),
+         firstvax = case_when(pcv7 == 1 ~ "pcv7",
+                              pcv13 == 1 ~ "pcv13",
+                              pcv15 == 1 ~ "pcv15",
+                              pcv20 == 1 ~ "pcv20",
+                              .default = "")) |> 
+  filter(st != "MISS" & st != "NT") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number()) |> 
+  ungroup() |> 
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+```
+
+### Smooth with p-splines
+
+```{r, eval = FALSE}
+gmods <- list()
+
+for (i in names(us)) {
+  gmods[[i]] <- tryCatch(
+    {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 25),
+                    family = poisson,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = us[[i]]),
+        success = 1
+      )
+    },
+    warning = function(w) {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 25),
+                    family = poisson,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = us[[i]]),
+        success = 0
+      )
+    }
+  )
+}
+
+smooth_us <- list()
+
+for (i in names(us)){
+  smooth_us[[i]] = data.frame(fitcases = gmods[[i]]$model$fitted.values) %>% 
+    dplyr::mutate(nyear = seq.int(from = 1, by = 1, length.out = n()),
+                  success = gmods[[i]]$success)
+}
+
+# smooth_us |> 
+#   enframe() |> 
+#   unnest(cols = c(value)) |> 
+#   select(name, success) |> 
+#   distinct() |> 
+#   filter(success == 0)
+
+# no gam convergence for 12B, 15D, 16A, 18, 19B, 19C, 25F, 33B, 35, 41A, 43, 45, 47F
+
+ts_us <- smooth_us |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+tslabels_us <- tibble(name = names(ts_us),
+                      group = 1:length(ts_us))
+
+# write_rds(ts_us, "data/interim/ts_us.rds")
+# write_rds(tslabels_us, "data/interim/tslabels_us.rds")
+```
+
+### Determine window and cluster size
+
+```{r, eval = FALSE}
+cfg <- dtwclust::compare_clusterings_configs(
+  types = "hierarchical", 
+  k = 2L:71L, 
+  controls = list(hierarchical = hierarchical_control(method = "average")), 
+  distances = pdc_configs("distance", hierarchical = list(dtw = list(window.size = seq(from = 1L, to = 25L, by = 1L), norm = c("L1")))),
+  centroids = pdc_configs("centroid", hierarchical = list(dba = list(window.size = seq(from = 1L, to = 25L, by = 1L), norm = c("L1")))),
+  preprocs = pdc_configs("preproc", hierarchical = list(zscore = list(window.size = seq(from = 1L, to = 25L, by = 1L), norm = c("L1")))),
+  no.expand = c("window.size", "norm" ))
+
+evaluators <- cvi_evaluators(c("valid"))
+
+comparison_us <- compare_clusterings(ts_us, 
+                                  types = "hierarchical", 
+                                  configs = cfg, 
+                                  seed = 8L, 
+                                  score.clus = evaluators$score, 
+                                  pick.clus = evaluators$pick)
+
+result_us <- comparison_us$results$hierarchical |> 
+  arrange(DBstar)
+
+# write_rds(comparison_us, "data/interim/dtw-us-comparison.rds")
+# write_rds(result_us, "data/interim/dtw-us-compresult.rds")
+```
+
+```{r, echo = FALSE}
+result_us <- read_rds("data/interim/dtw-us-compresult.rds")
+
+head(result_us, n = 10)
+```
+
+### DTW clustering {.tabset}
+
+```{r, echo = FALSE}
+ts_us <- read_rds("data/interim/ts_us.rds")
+tslabels_us <- read_rds("data/interim/tslabels_us.rds")
+```
+
+#### k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_us1 <- dtwclust::tsclust(ts_us,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_us1 <- as.data.frame((ggplot_build(plot(dtw_us1, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_us, by = "group")
+
+hc_centroid_us1 <- as.data.frame((ggplot_build(plot(dtw_us1, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_us1 <- label(dendro_data(as.dendrogram(dtw_us1))) |> 
+  left_join(hc_members_us1 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_us1 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_us1) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_us1, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 3, window = 20
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_us2 <- dtwclust::tsclust(ts_us,
+                            type = "hierarchical",
+                            k = 3,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 20), cent = dba))
+
+hc_members_us2 <- as.data.frame((ggplot_build(plot(dtw_us2, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_us, by = "group")
+
+hc_centroid_us2 <- as.data.frame((ggplot_build(plot(dtw_us2, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_us2 <- label(dendro_data(as.dendrogram(dtw_us2))) |> 
+  left_join(hc_members_us2 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_us2 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_us2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_us2, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 4, window = 25
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_us3 <- dtwclust::tsclust(ts_us,
+                            type = "hierarchical",
+                            k = 4,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 25), cent = dba))
+
+hc_members_us3 <- as.data.frame((ggplot_build(plot(dtw_us3, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_us, by = "group")
+
+hc_centroid_us3 <- as.data.frame((ggplot_build(plot(dtw_us3, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_us3 <- label(dendro_data(as.dendrogram(dtw_us3))) |> 
+  left_join(hc_members_us3 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_us3 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_us3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_us3, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 5, window = 25
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_us4 <- dtwclust::tsclust(ts_us,
+                            type = "hierarchical",
+                            k = 5,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 25), cent = dba))
+
+hc_members_us4 <- as.data.frame((ggplot_build(plot(dtw_us4, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_us, by = "group")
+
+hc_centroid_us4 <- as.data.frame((ggplot_build(plot(dtw_us4, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_us4 <- label(dendro_data(as.dendrogram(dtw_us4))) |> 
+  left_join(hc_members_us4 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_us4 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_us4) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_us4, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 6, window = 25
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_us5 <- dtwclust::tsclust(ts_us,
+                            type = "hierarchical",
+                            k = 6,
+                            preproc = zscore,
+                            distance = "dtw_basic",
+                            control = hierarchical_control(method = "average"),
+                            trace = TRUE,
+                            args = tsclust_args(dist = list(window.size = 25), cent = dba))
+
+hc_members_us5 <- as.data.frame((ggplot_build(plot(dtw_us5, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_us, by = "group")
+
+hc_centroid_us5 <- as.data.frame((ggplot_build(plot(dtw_us5, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_us5 <- label(dendro_data(as.dendrogram(dtw_us5))) |> 
+  left_join(hc_members_us5 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_us5 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_us5) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_us5, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+## Australia
+
+```{r, echo = FALSE}
+aus_raw <- readxl::read_xlsx("data/aus_ipd.xlsx", skip = 1)
+
+aus <- aus_raw |> 
+  rename(year = Year,
+         st = Serotype)  |> 
+  group_by(year, st) |> 
+  summarise(N_IPD = n()) |> 
+  ungroup() |> 
+  complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(!grepl("[ /]", st) & st != "UNTYPED") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number()) |> 
+  ungroup() |> 
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+```
+
+### Smooth with p-splines
+
+```{r, eval = FALSE}
+gmods_aus <- list()
+
+for (i in names(aus)) {
+  gmods_aus[[i]] <- tryCatch(
+    {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 14),
+                    family = poisson,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = aus[[i]]),
+        success = 1
+      )
+    },
+    warning = function(w) {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 14),
+                    family = poisson,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = aus[[i]]),
+        success = 0
+      )
+    }
+  )
+}
+
+smooth_aus <- list()
+
+for (i in names(aus)){
+  smooth_aus[[i]] = data.frame(fitcases = gmods_aus[[i]]$model$fitted.values) %>% 
+    dplyr::mutate(nyear = seq.int(from = 1, by = 1, length.out = n()),
+                  success = gmods_aus[[i]]$success)
+}
+
+# smooth_aus |>
+#   enframe() |>
+#   unnest(cols = c(value)) |>
+#   select(name, success) |>
+#   distinct() |>
+#   filter(success == 0)
+
+# no gam convergence for 11C, 12A, 24A, 25F, 27, 28, 32, 32F, 45, 6
+
+ts_aus <- smooth_aus |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+tslabels_aus <- tibble(name = names(ts_aus),
+                      group = 1:length(ts_aus))
+
+# write_rds(ts_aus, "data/interim/ts_aus.rds")
+# write_rds(tslabels_aus, "data/interim/tslabels_aus.rds")
+```
+
+### Determine window and cluster size
+
+```{r, echo = FALSE, eval = FALSE}
+cfg_aus <- dtwclust::compare_clusterings_configs(
+  types = "hierarchical", 
+  k = 2L:69L, 
+  controls = list(hierarchical = hierarchical_control(method = "average")), 
+  distances = pdc_configs("distance", hierarchical = list(dtw = list(window.size = seq(from = 1L, to = 25L, by = 1L), norm = c("L1")))),
+  centroids = pdc_configs("centroid", hierarchical = list(dba = list(window.size = seq(from = 1L, to = 25L, by = 1L), norm = c("L1")))),
+  preprocs = pdc_configs("preproc", hierarchical = list(zscore = list(window.size = seq(from = 1L, to = 25L, by = 1L), norm = c("L1")))),
+  no.expand = c("window.size", "norm"))
+
+comparison_aus <- compare_clusterings(ts_aus, 
+                                  types = "hierarchical", 
+                                  configs = cfg_aus, 
+                                  seed = 8L, 
+                                  score.clus = evaluators$score, 
+                                  pick.clus = evaluators$pick)
+
+result_aus <- comparison_aus$results$hierarchical |> 
+  arrange(DBstar)
+
+# write_rds(comparison_aus, "data/interim/dtw-aus-comparison.rds")
+# write_rds(result_aus, "data/interim/dtw-aus-compresult.rds")
+```
+
+```{r, echo = FALSE}
+result_aus <- read_rds("data/interim/dtw-aus-compresult.rds")
+
+head(result_aus)
+```
+
+### DTW clustering - same config as US {.tabset}
+
+```{r, echo = FALSE}
+ts_aus <- read_rds("data/interim/ts_aus.rds")
+tslabels_aus <- read_rds("data/interim/tslabels_aus.rds")
+```
+
+#### k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_aus1 <- dtwclust::tsclust(ts_aus,
+                             type = "hierarchical",
+                             k = 5,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_aus1 <- as.data.frame((ggplot_build(plot(dtw_aus1, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_aus, by = "group")
+
+hc_centroid_aus1 <- as.data.frame((ggplot_build(plot(dtw_aus1, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_aus1 <- label(dendro_data(as.dendrogram(dtw_aus1))) |> 
+  left_join(hc_members_aus1 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_aus1 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_aus1) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_aus1, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 3, window = 20
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_aus2 <- dtwclust::tsclust(ts_aus,
+                             type = "hierarchical",
+                             k = 3,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 20), cent = dba))
+
+hc_members_aus2 <- as.data.frame((ggplot_build(plot(dtw_aus2, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_aus, by = "group")
+
+hc_centroid_aus2 <- as.data.frame((ggplot_build(plot(dtw_aus2, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_aus2 <- label(dendro_data(as.dendrogram(dtw_aus2))) |> 
+  left_join(hc_members_aus2 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_aus2 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_aus2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_aus2, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 4, window = 25
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_aus3 <- dtwclust::tsclust(ts_aus,
+                             type = "hierarchical",
+                             k = 4,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 25), cent = dba))
+
+hc_members_aus3 <- as.data.frame((ggplot_build(plot(dtw_aus3, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_aus, by = "group")
+
+hc_centroid_aus3 <- as.data.frame((ggplot_build(plot(dtw_aus3, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_aus3 <- label(dendro_data(as.dendrogram(dtw_aus3))) |> 
+  left_join(hc_members_aus3 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_aus3 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_aus3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_aus3, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 5, window = 25
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_aus4 <- dtwclust::tsclust(ts_aus,
+                             type = "hierarchical",
+                             k = 5,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 25), cent = dba))
+
+hc_members_aus4 <- as.data.frame((ggplot_build(plot(dtw_aus4, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_aus, by = "group")
+
+hc_centroid_aus4 <- as.data.frame((ggplot_build(plot(dtw_aus4, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_aus4 <- label(dendro_data(as.dendrogram(dtw_aus4))) |> 
+  left_join(hc_members_aus4 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_aus4 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_aus4) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_aus4, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 6, window = 25
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_aus5 <- dtwclust::tsclust(ts_aus,
+                             type = "hierarchical",
+                             k = 6,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 25), cent = dba))
+
+hc_members_aus5 <- as.data.frame((ggplot_build(plot(dtw_aus5, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_aus, by = "group")
+
+hc_centroid_aus5 <- as.data.frame((ggplot_build(plot(dtw_aus5, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_aus5 <- label(dendro_data(as.dendrogram(dtw_aus5))) |> 
+  left_join(hc_members_aus5 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_aus5 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_aus5) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_aus5, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+### DTW clustering - best configs for Australia {.tabset}
+
+#### k = 3, window = 12
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_aus6 <- dtwclust::tsclust(ts_aus,
+                             type = "hierarchical",
+                             k = 3,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 12), cent = dba))
+
+hc_members_aus6 <- as.data.frame((ggplot_build(plot(dtw_aus6, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_aus, by = "group")
+
+hc_centroid_aus6 <- as.data.frame((ggplot_build(plot(dtw_aus6, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_aus6 <- label(dendro_data(as.dendrogram(dtw_aus6))) |> 
+  left_join(hc_members_aus6 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_aus6 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_aus6) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_aus6, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 3, window = 9
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_aus7 <- dtwclust::tsclust(ts_aus,
+                             type = "hierarchical",
+                             k = 3,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 9), cent = dba))
+
+hc_members_aus7 <- as.data.frame((ggplot_build(plot(dtw_aus7, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_aus, by = "group")
+
+hc_centroid_aus7 <- as.data.frame((ggplot_build(plot(dtw_aus7, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_aus7 <- label(dendro_data(as.dendrogram(dtw_aus7))) |> 
+  left_join(hc_members_aus7 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_aus7 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_aus7) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_aus7, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 2, window = 11
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_aus8 <- dtwclust::tsclust(ts_aus,
+                             type = "hierarchical",
+                             k = 2,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 11), cent = dba))
+
+hc_members_aus8 <- as.data.frame((ggplot_build(plot(dtw_aus8, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_aus, by = "group")
+
+hc_centroid_aus8 <- as.data.frame((ggplot_build(plot(dtw_aus8, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_aus8 <- label(dendro_data(as.dendrogram(dtw_aus8))) |> 
+  left_join(hc_members_aus8 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_aus8 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_aus8) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_aus8, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 3, window = 14
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_aus9 <- dtwclust::tsclust(ts_aus,
+                             type = "hierarchical",
+                             k = 3,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 14), cent = dba))
+
+hc_members_aus9 <- as.data.frame((ggplot_build(plot(dtw_aus9, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_aus, by = "group")
+
+hc_centroid_aus9 <- as.data.frame((ggplot_build(plot(dtw_aus9, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_aus9 <- label(dendro_data(as.dendrogram(dtw_aus9))) |> 
+  left_join(hc_members_aus9 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_aus9 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_aus9) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_aus9, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+## United Kingdom
+
+```{r, echo = FALSE}
+eur_raw <- read_csv("data/ecdc_processed.csv", col_select = -1)
+
+eur <- eur_raw |> 
+  group_by(country, year, st) |> 
+  summarise(N_IPD = sum(total_cases, na.rm = TRUE)) |> 
+  ungroup()
+```
+
+```{r, fig.width = 12, fig.height = 12}
+eur |> 
+  ggplot(aes(x = year, y = N_IPD, color = country)) +
+  geom_line() +
+  facet_wrap(~st) +
+  theme_bw()
+
+eur |> 
+  ggplot(aes(x = year, y = N_IPD, color = st)) +
+  geom_line() +
+  facet_wrap(~country) +
+  theme_bw()
+```
+
+```{r, echo = FALSE}
+uk <- eur |> 
+  filter(country == "United Kingdom") |> 
+  select(-country) |> 
+  complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(st != "NTYP") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number()) |> 
+  ungroup() |> 
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+```
+
+### Smooth with p-splines
+
+```{r, eval = FALSE}
+gmods_uk <- list()
+
+for (i in names(uk)) {
+  gmods_uk[[i]] <- tryCatch(
+    {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 9),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = uk[[i]]),
+        success = 1
+      )
+    },
+    warning = function(w) {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 9),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = uk[[i]]),
+        success = 0
+      )
+    }
+  )
+}
+
+smooth_uk <- list()
+
+for (i in names(uk)){
+  smooth_uk[[i]] = data.frame(fitcases = gmods_uk[[i]]$model$fitted.values) %>% 
+    dplyr::mutate(nyear = seq.int(from = 1, by = 1, length.out = n()),
+                  success = gmods_uk[[i]]$success)
+}
+
+# smooth_uk |>
+#   enframe() |>
+#   unnest(cols = c(value)) |>
+#   select(name, success) |>
+#   distinct() |>
+#   filter(success == 0)
+
+# no gam convergence for 45, 46, 48
+
+ts_uk <- smooth_uk |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+tslabels_uk <- tibble(name = names(ts_uk),
+                      group = 1:length(ts_uk))
+
+# write_rds(ts_uk, "data/interim/ts_uk.rds")
+# write_rds(tslabels_uk, "data/interim/tslabels_uk.rds")
+```
+
+```{r, echo = FALSE}
+ts_uk <- read_rds("data/interim/ts_uk.rds")
+tslabels_uk <- read_rds("data/interim/tslabels_uk.rds")
+```
+
+```{r, fig.width = 12, fig.height = 12}
+smooth_uk |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  ggplot(aes(x = nyear, y = fitcases, color = name)) +
+  geom_line() +
+  theme_bw()
+
+eur |> 
+  filter(country == "United Kingdom") |> 
+  ggplot(aes(x = year, y = N_IPD, color = st)) +
+  geom_line() +
+  theme_bw()
+
+eur |> 
+  filter(country == "United Kingdom") |> 
+  ggplot(aes(x = year, y = N_IPD)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~st, scales = "free_y") +
+  theme_bw()
+```
+
+### Determine window and cluster size
+
+```{r, echo = FALSE, eval = FALSE}
+cfg_uk <- dtwclust::compare_clusterings_configs(
+  types = "hierarchical", 
+  k = 2L:93L, 
+  controls = list(hierarchical = hierarchical_control(method = "average")), 
+  distances = pdc_configs("distance", hierarchical = list(dtw = list(window.size = seq(from = 1L, to = 9L, by = 1L), norm = c("L1")))),
+  centroids = pdc_configs("centroid", hierarchical = list(dba = list(window.size = seq(from = 1L, to = 9L, by = 1L), norm = c("L1")))),
+  preprocs = pdc_configs("preproc", hierarchical = list(zscore = list(window.size = seq(from = 1L, to = 9L, by = 1L), norm = c("L1")))),
+  no.expand = c("window.size", "norm"))
+
+comparison_uk <- compare_clusterings(ts_uk, 
+                                  types = "hierarchical", 
+                                  configs = cfg_uk, 
+                                  seed = 8L, 
+                                  score.clus = evaluators$score, 
+                                  pick.clus = evaluators$pick)
+
+result_uk <- comparison_uk$results$hierarchical |> 
+  arrange(DBstar)
+
+# write_rds(comparison_uk, "data/interim/dtw-uk-comparison.rds")
+# write_rds(result_uk, "data/interim/dtw-uk-compresult.rds")
+```
+
+```{r, eval = FALSE, echo = FALSE}
+result_uk <- read_rds("data/interim/dtw-uk-compresult.rds")
+
+head(result_uk)
+```
+
+### DTW clustering {.tabset}
+
+#### k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_uk1 <- dtwclust::tsclust(ts_uk,
+                             type = "hierarchical",
+                             k = 5,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_uk1 <- as.data.frame((ggplot_build(plot(dtw_uk1, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_uk, by = "group")
+
+hc_centroid_uk1 <- as.data.frame((ggplot_build(plot(dtw_uk1, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_uk1 <- label(dendro_data(as.dendrogram(dtw_uk1))) |> 
+  left_join(hc_members_uk1 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_uk1 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_uk1) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_uk1, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 3, window = 9
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_uk2 <- dtwclust::tsclust(ts_uk,
+                             type = "hierarchical",
+                             k = 3,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 9), cent = dba))
+
+hc_members_uk2 <- as.data.frame((ggplot_build(plot(dtw_uk2, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_uk, by = "group")
+
+hc_centroid_uk2 <- as.data.frame((ggplot_build(plot(dtw_uk2, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_uk2 <- label(dendro_data(as.dendrogram(dtw_uk2))) |> 
+  left_join(hc_members_uk2 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_uk2 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_uk2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_uk2, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 4, window = 9
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_uk3 <- dtwclust::tsclust(ts_uk,
+                             type = "hierarchical",
+                             k = 4,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 9), cent = dba))
+
+hc_members_uk3 <- as.data.frame((ggplot_build(plot(dtw_uk3, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_uk, by = "group")
+
+hc_centroid_uk3 <- as.data.frame((ggplot_build(plot(dtw_uk3, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_uk3 <- label(dendro_data(as.dendrogram(dtw_uk3))) |> 
+  left_join(hc_members_uk3 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_uk3 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_uk3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_uk3, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+## France
+
+```{r, echo = FALSE}
+fra <- eur |> 
+  filter(country == "France") |> 
+  select(-country) |> 
+  complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(st != "NTYP") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number()) |> 
+  ungroup() |> 
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+```
+
+### Smooth with p-splines
+
+```{r, eval = FALSE}
+gmods_fra <- list()
+
+for (i in names(fra)) {
+  gmods_fra[[i]] <- tryCatch(
+    {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 9),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = fra[[i]]),
+        success = 1
+      )
+    },
+    warning = function(w) {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 9),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = fra[[i]]),
+        success = 0
+      )
+    }
+  )
+}
+
+smooth_fra <- list()
+
+for (i in names(fra)){
+  smooth_fra[[i]] = data.frame(fitcases = gmods_fra[[i]]$model$fitted.values) %>% 
+    dplyr::mutate(nyear = seq.int(from = 1, by = 1, length.out = n()),
+                  success = gmods_fra[[i]]$success)
+}
+
+# smooth_fra |>
+#   enframe() |>
+#   unnest(cols = c(value)) |>
+#   select(name, success) |>
+#   distinct() |>
+#   filter(success == 0)
+
+# no gam convergence for 45, 46, 48
+
+ts_fra <- smooth_fra |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+tslabels_fra<- tibble(name = names(ts_fra),
+                      group = 1:length(ts_fra))
+
+# write_rds(ts_fra, "data/interim/ts_fra.rds")
+# write_rds(tslabels_fra, "data/interim/tslabels_fra.rds")
+```
+
+### Determine window and cluster size
+
+```{r, echo = FALSE, eval = FALSE}
+cfg_fra <- dtwclust::compare_clusterings_configs(
+  types = "hierarchical", 
+  k = 2L:93L, 
+  controls = list(hierarchical = hierarchical_control(method = "average")), 
+  distances = pdc_configs("distance", hierarchical = list(dtw = list(window.size = seq(from = 1L, to = 9L, by = 1L), norm = c("L1")))),
+  centroids = pdc_configs("centroid", hierarchical = list(dba = list(window.size = seq(from = 1L, to = 9L, by = 1L), norm = c("L1")))),
+  preprocs = pdc_configs("preproc", hierarchical = list(zscore = list(window.size = seq(from = 1L, to = 9L, by = 1L), norm = c("L1")))),
+  no.expand = c("window.size", "norm"))
+
+comparison_fra <- compare_clusterings(ts_fra, 
+                                  types = "hierarchical", 
+                                  configs = cfg_fra, 
+                                  seed = 8L, 
+                                  score.clus = evaluators$score, 
+                                  pick.clus = evaluators$pick)
+
+result_fra <- comparison_fra$results$hierarchical |> 
+  arrange(DBstar)
+
+write_rds(comparison_fra, "data/interim/dtw-fra-comparison.rds")
+write_rds(result_fra, "data/interim/dtw-fra-compresult.rds")
+```
+
+```{r, eval = FALSE, echo = FALSE}
+result_fra <- read_rds("data/interim/dtw-fra-compresult.rds")
+
+head(result_fra)
+```
+
+### DTW clustering {.tabset}
+
+```{r, echo = FALSE}
+ts_fra <- read_rds("data/interim/ts_fra.rds")
+tslabels_fra <- read_rds("data/interim/tslabels_fra.rds")
+```
+
+#### k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_fra1 <- dtwclust::tsclust(fra,
+                             type = "hierarchical",
+                             k = 5,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_fra1 <- as.data.frame((ggplot_build(plot(dtw_fra1, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_fra, by = "group")
+
+hc_centroid_fra1 <- as.data.frame((ggplot_build(plot(dtw_fra1, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_fra1 <- label(dendro_data(as.dendrogram(dtw_fra1))) |> 
+  left_join(hc_members_fra1 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_fra1 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_fra1) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_fra1, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 3, window = 9
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_fra2 <- dtwclust::tsclust(ts_fra,
+                             type = "hierarchical",
+                             k = 3,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 9), cent = dba))
+
+hc_members_fra2 <- as.data.frame((ggplot_build(plot(dtw_fra2, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_fra, by = "group")
+
+hc_centroid_fra2 <- as.data.frame((ggplot_build(plot(dtw_fra2, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_fra2 <- label(dendro_data(as.dendrogram(dtw_fra2))) |> 
+  left_join(hc_members_fra2 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_fra2 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_fra2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_fra2, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 4, window = 9
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_fra3 <- dtwclust::tsclust(ts_fra,
+                             type = "hierarchical",
+                             k = 4,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 9), cent = dba))
+
+hc_members_fra3 <- as.data.frame((ggplot_build(plot(dtw_fra3, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_fra, by = "group")
+
+hc_centroid_fra3 <- as.data.frame((ggplot_build(plot(dtw_fra3, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_fra3 <- label(dendro_data(as.dendrogram(dtw_fra3))) |> 
+  left_join(hc_members_fra3 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_fra3 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_fra3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_fra3, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+## Spain
+
+```{r, echo = FALSE}
+spa <- eur |> 
+  filter(country == "Spain") |> 
+  select(-country) |> 
+  complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(st != "NTYP") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number()) |> 
+  ungroup() |> 
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+```
+
+### Smooth with p-splines
+
+```{r, eval = FALSE}
+gmods_spa <- list()
+
+for (i in names(spa)) {
+  gmods_spa[[i]] <- tryCatch(
+    {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 11),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = spa[[i]]),
+        success = 1
+      )
+    },
+    warning = function(w) {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 11),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = spa[[i]]),
+        success = 0
+      )
+    }
+  )
+}
+
+smooth_spa <- list()
+
+for (i in names(spa)){
+  smooth_spa[[i]] = data.frame(fitcases = gmods_spa[[i]]$model$fitted.values) %>% 
+    dplyr::mutate(nyear = seq.int(from = 1, by = 1, length.out = n()),
+                  success = gmods_spa[[i]]$success)
+}
+
+# smooth_spa |>
+#   enframe() |>
+#   unnest(cols = c(value)) |>
+#   select(name, success) |>
+#   distinct() |>
+#   filter(success == 0)
+
+# no gam convergence for 11E, 41A, 45, 46, 48
+
+ts_spa <- smooth_spa |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+tslabels_spa <- tibble(name = names(ts_spa),
+                       group = 1:length(ts_spa))
+
+# write_rds(ts_spa, "data/interim/ts_spa.rds")
+# write_rds(tslabels_spa, "data/interim/tslabels_spa.rds")
+```
+
+### Determine window and cluster size
+
+```{r, echo = FALSE, eval = FALSE}
+cfg_spa <- dtwclust::compare_clusterings_configs(
+  types = "hierarchical", 
+  k = 2L:93L, 
+  controls = list(hierarchical = hierarchical_control(method = "average")), 
+  distances = pdc_configs("distance", hierarchical = list(dtw = list(window.size = seq(from = 1L, to = 11L, by = 1L), norm = c("L1")))),
+  centroids = pdc_configs("centroid", hierarchical = list(dba = list(window.size = seq(from = 1L, to = 11L, by = 1L), norm = c("L1")))),
+  preprocs = pdc_configs("preproc", hierarchical = list(zscore = list(window.size = seq(from = 1L, to = 11L, by = 1L), norm = c("L1")))),
+  no.expand = c("window.size", "norm"))
+
+comparison_spa <- compare_clusterings(ts_spa, 
+                                  types = "hierarchical", 
+                                  configs = cfg_spa, 
+                                  seed = 8L, 
+                                  score.clus = evaluators$score, 
+                                  pick.clus = evaluators$pick)
+
+result_spa <- comparison_spa$results$hierarchical |> 
+  arrange(DBstar)
+
+write_rds(comparison_spa, "data/interim/dtw-spa-comparison.rds")
+write_rds(result_spa, "data/interim/dtw-spa-compresult.rds")
+```
+
+```{r, eval = FALSE, echo = FALSE}
+result_spa <- read_rds("data/interim/dtw-spa-compresult.rds")
+
+head(result_spa)
+```
+
+### DTW clustering {.tabset}
+
+```{r, echo = FALSE}
+ts_spa <- read_rds("data/interim/ts_spa.rds")
+tslabels_spa <- read_rds("data/interim/tslabels_spa.rds")
+```
+
+#### k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_spa1 <- dtwclust::tsclust(ts_spa,
+                             type = "hierarchical",
+                             k = 5,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_spa1 <- as.data.frame((ggplot_build(plot(dtw_spa1, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_spa, by = "group")
+
+hc_centroid_spa1 <- as.data.frame((ggplot_build(plot(dtw_spa1, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_spa1 <- label(dendro_data(as.dendrogram(dtw_spa1))) |> 
+  left_join(hc_members_spa1 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_spa1 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_spa1) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_spa1, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 3, window = 9
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_spa2 <- dtwclust::tsclust(ts_spa,
+                             type = "hierarchical",
+                             k = 3,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 9), cent = dba))
+
+hc_members_spa2 <- as.data.frame((ggplot_build(plot(dtw_spa2, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_spa, by = "group")
+
+hc_centroid_spa2 <- as.data.frame((ggplot_build(plot(dtw_spa2, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_spa2 <- label(dendro_data(as.dendrogram(dtw_spa2))) |> 
+  left_join(hc_members_spa2 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_spa2 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_spa2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_spa2, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 4, window = 9
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_spa3 <- dtwclust::tsclust(ts_spa,
+                             type = "hierarchical",
+                             k = 4,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 9), cent = dba))
+
+hc_members_spa3 <- as.data.frame((ggplot_build(plot(dtw_spa3, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_spa, by = "group")
+
+hc_centroid_spa3 <- as.data.frame((ggplot_build(plot(dtw_spa3, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_spa3 <- label(dendro_data(as.dendrogram(dtw_spa3))) |> 
+  left_join(hc_members_spa3 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_spa3 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_spa3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_spa3, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+## Sweden 
+
+```{r, echo = FALSE}
+swe <- eur |> 
+  filter(country == "Sweden") |> 
+  select(-country) |> 
+  complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(st != "NTYP") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number()) |> 
+  ungroup() |> 
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+```
+
+### Smooth with p-splines
+
+```{r, eval = FALSE}
+gmods_swe <- list()
+
+for (i in names(swe)) {
+  gmods_swe[[i]] <- tryCatch(
+    {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 10),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = swe[[i]]),
+        success = 1
+      )
+    },
+    warning = function(w) {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 10),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = swe[[i]]),
+        success = 0
+      )
+    }
+  )
+}
+
+smooth_swe<- list()
+
+for (i in names(swe)){
+  smooth_swe[[i]] = data.frame(fitcases = gmods_swe[[i]]$model$fitted.values) %>% 
+    dplyr::mutate(nyear = seq.int(from = 1, by = 1, length.out = n()),
+                  success = gmods_swe[[i]]$success)
+}
+
+# smooth_swe |>
+#   enframe() |>
+#   unnest(cols = c(value)) |>
+#   select(name, success) |>
+#   distinct() |>
+#   filter(success == 0)
+
+
+# no gam convergence for 11E, 41A, 45, 46, 47F, 48
+
+ts_swe <- smooth_swe |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+tslabels_swe <- tibble(name = names(ts_swe),
+                      group = 1:length(ts_swe))
+
+# write_rds(ts_swe, "data/interim/ts_swe.rds")
+# write_rds(tslabels_swe, "data/interim/tslabels_swe.rds")
+```
+
+### Determine window and cluster size
+
+```{r, echo = FALSE, eval = FALSE}
+cfg_swe <- dtwclust::compare_clusterings_configs(
+  types = "hierarchical", 
+  k = 2L:90L, 
+  controls = list(hierarchical = hierarchical_control(method = "average")), 
+  distances = pdc_configs("distance", hierarchical = list(dtw = list(window.size = seq(from = 1L, to = 10L, by = 1L), norm = c("L1")))),
+  centroids = pdc_configs("centroid", hierarchical = list(dba = list(window.size = seq(from = 1L, to = 10L, by = 1L), norm = c("L1")))),
+  preprocs = pdc_configs("preproc", hierarchical = list(zscore = list(window.size = seq(from = 1L, to = 10L, by = 1L), norm = c("L1")))),
+  no.expand = c("window.size", "norm"))
+
+comparison_swe <- compare_clusterings(ts_swe, 
+                                  types = "hierarchical", 
+                                  configs = cfg_swe, 
+                                  seed = 8L, 
+                                  score.clus = evaluators$score, 
+                                  pick.clus = evaluators$pick)
+
+result_swe <- comparison_swe$results$hierarchical |> 
+  arrange(DBstar)
+
+write_rds(comparison_swe, "data/interim/dtw-swe-comparison.rds")
+write_rds(result_swe, "data/interim/dtw-swe-compresult.rds")
+```
+
+```{r, eval = FALSE, echo = FALSE}
+result_swe <- read_rds("data/interim/dtw-swe-compresult.rds")
+
+head(result_swe)
+```
+
+### DTW clustering {.tabset}
+
+```{r, echo = FALSE}
+ts_swe <- read_rds("data/interim/ts_swe.rds")
+tslabels_swe <- read_rds("data/interim/tslabels_swe.rds")
+```
+
+#### k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_swe1 <- dtwclust::tsclust(ts_swe,
+                             type = "hierarchical",
+                             k = 5,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_swe1 <- as.data.frame((ggplot_build(plot(dtw_swe1, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_swe, by = "group")
+
+hc_centroid_swe1 <- as.data.frame((ggplot_build(plot(dtw_swe1, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_swe1 <- label(dendro_data(as.dendrogram(dtw_swe1))) |> 
+  left_join(hc_members_swe1 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_swe1 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_swe1) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_swe1, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 3, window = 9
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_swe2 <- dtwclust::tsclust(ts_swe,
+                             type = "hierarchical",
+                             k = 3,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 9), cent = dba))
+
+hc_members_swe2 <- as.data.frame((ggplot_build(plot(dtw_swe2, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_swe, by = "group")
+
+hc_centroid_swe2 <- as.data.frame((ggplot_build(plot(dtw_swe2, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_swe2 <- label(dendro_data(as.dendrogram(dtw_swe2))) |> 
+  left_join(hc_members_swe2 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_swe2 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_swe2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_swe2, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 4, window = 9
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_swe3 <- dtwclust::tsclust(ts_swe,
+                             type = "hierarchical",
+                             k = 4,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 9), cent = dba))
+
+hc_members_swe3 <- as.data.frame((ggplot_build(plot(dtw_swe3, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_swe, by = "group")
+
+hc_centroid_swe3 <- as.data.frame((ggplot_build(plot(dtw_swe3, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_swe3 <- label(dendro_data(as.dendrogram(dtw_swe3))) |> 
+  left_join(hc_members_swe3 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_swe3 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_swe3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_swe3, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+## Austria
+
+```{r, echo = FALSE}
+au <- eur |> 
+  filter(country == "Austria") |> 
+  select(-country) |> 
+  complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(st != "NTYP" & st != "15B/C") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number()) |> 
+  ungroup() |> 
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+```
+
+### Smooth with p-splines
+
+```{r, eval = FALSE}
+gmods_au <- list()
+
+for (i in names(au)) {
+  gmods_au[[i]] <- tryCatch(
+    {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 9),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = au[[i]]),
+        success = 1
+      )
+    },
+    warning = function(w) {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 9),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = au[[i]]),
+        success = 0
+      )
+    }
+  )
+}
+
+smooth_au <- list()
+
+for (i in names(au)){
+  smooth_au[[i]] = data.frame(fitcases = gmods_au[[i]]$model$fitted.values) %>% 
+    dplyr::mutate(nyear = seq.int(from = 1, by = 1, length.out = n()),
+                  success = gmods_au[[i]]$success)
+}
+
+smooth_au |>
+  enframe() |>
+  unnest(cols = c(value)) |>
+  select(name, success) |>
+  distinct() |>
+  filter(success == 0)
+
+
+# no gam convergence for 45, 46, 47F, 48
+
+ts_au <- smooth_au |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+tslabels_au <- tibble(name = names(ts_au),
+                      group = 1:length(ts_au))
+
+# write_rds(ts_au, "data/interim/ts_au.rds")
+# write_rds(tslabels_au, "data/interim/tslabels_au.rds")
+```
+
+### Determine window and cluster size
+
+```{r, echo = FALSE, eval = FALSE}
+cfg_au <- dtwclust::compare_clusterings_configs(
+  types = "hierarchical", 
+  k = 2L:94L, 
+  controls = list(hierarchical = hierarchical_control(method = "average")), 
+  distances = pdc_configs("distance", hierarchical = list(dtw = list(window.size = seq(from = 1L, to = 9L, by = 1L), norm = c("L1")))),
+  centroids = pdc_configs("centroid", hierarchical = list(dba = list(window.size = seq(from = 1L, to = 9L, by = 1L), norm = c("L1")))),
+  preprocs = pdc_configs("preproc", hierarchical = list(zscore = list(window.size = seq(from = 1L, to = 9L, by = 1L), norm = c("L1")))),
+  no.expand = c("window.size", "norm"))
+
+comparison_au <- compare_clusterings(ts_au, 
+                                  types = "hierarchical", 
+                                  configs = cfg_au, 
+                                  seed = 8L, 
+                                  score.clus = evaluators$score, 
+                                  pick.clus = evaluators$pick)
+
+result_au <- comparison_au$results$hierarchical |> 
+  arrange(DBstar)
+
+write_rds(comparison_au, "data/interim/dtw-au-comparison.rds")
+write_rds(result_au, "data/interim/dtw-au-compresult.rds")
+```
+
+```{r, eval = FALSE, echo = FALSE}
+result_au <- read_rds("data/interim/dtw-au-compresult.rds")
+
+head(result_au)
+```
+
+### DTW clustering {.tabset}
+
+```{r, echo = FALSE}
+ts_au <- read_rds("data/interim/ts_au.rds")
+tslabels_au <- read_rds("data/interim/tslabels_au.rds")
+```
+
+#### k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_au1 <- dtwclust::tsclust(ts_au,
+                             type = "hierarchical",
+                             k = 5,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_au1 <- as.data.frame((ggplot_build(plot(dtw_au1, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_au, by = "group")
+
+hc_centroid_au1 <- as.data.frame((ggplot_build(plot(dtw_au1, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_au1 <- label(dendro_data(as.dendrogram(dtw_au1))) |> 
+  left_join(hc_members_au1 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_au1 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_au1) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_au1, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 3, window = 9
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_au2 <- dtwclust::tsclust(ts_au,
+                             type = "hierarchical",
+                             k = 3,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 9), cent = dba))
+
+hc_members_au2 <- as.data.frame((ggplot_build(plot(dtw_au2, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_au, by = "group")
+
+hc_centroid_au2 <- as.data.frame((ggplot_build(plot(dtw_au2, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_au2 <- label(dendro_data(as.dendrogram(dtw_au2))) |> 
+  left_join(hc_members_au2 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_au2 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_au2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_au2, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 4, window = 9
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_au3 <- dtwclust::tsclust(ts_au,
+                             type = "hierarchical",
+                             k = 4,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 9), cent = dba))
+
+hc_members_au3 <- as.data.frame((ggplot_build(plot(dtw_au3, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_au, by = "group")
+
+hc_centroid_au3 <- as.data.frame((ggplot_build(plot(dtw_au3, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_au3 <- label(dendro_data(as.dendrogram(dtw_au3))) |> 
+  left_join(hc_members_au3 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_au3 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_au3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_au3, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+## Netherlands
+
+```{r, echo = FALSE}
+net <- eur |> 
+  filter(country == "Netherlands") |> 
+  select(-country) |> 
+  complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(st != "NTYP") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number()) |> 
+  ungroup() |> 
+  dplyr::select(st, N_IPD, nyear) |> 
+  nest(.by = "st") |> 
+  deframe()
+```
+
+### Smooth with p-splines
+
+```{r, eval = FALSE}
+gmods_net <- list()
+
+for (i in names(net)) {
+  gmods_net[[i]] <- tryCatch(
+    {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 11),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = net[[i]]),
+        success = 1
+      )
+    },
+    warning = function(w) {
+      list(
+        model = gam(N_IPD ~ s(x = nyear, bs = "ps", k = 11),
+                    family = nb,
+                    method = "REML",
+                    control = list(maxit = 100000),
+                    data = net[[i]]),
+        success = 0
+      )
+    }
+  )
+}
+
+smooth_net<- list()
+
+for (i in names(net)){
+  smooth_net[[i]] = data.frame(fitcases = gmods_net[[i]]$model$fitted.values) %>% 
+    dplyr::mutate(nyear = seq.int(from = 1, by = 1, length.out = n()),
+                  success = gmods_net[[i]]$success)
+}
+
+# smooth_net |>
+#   enframe() |>
+#   unnest(cols = c(value)) |>
+#   select(name, success) |>
+#   distinct() |>
+#   filter(success == 0)
+
+
+# no gam convergence for 11E, 41A, 45, 46, 47F, 48
+
+ts_net <- smooth_net |>
+  enframe() |> 
+  unnest(cols = c(value)) |> 
+  filter(success == 1) |> 
+  group_by(name) |> 
+  summarise(fitcases = list(fitcases)) |> 
+  pull(fitcases, name = name)
+
+tslabels_net <- tibble(name = names(ts_net),
+                      group = 1:length(ts_net))
+
+# write_rds(ts_net, "data/interim/ts_net.rds")
+# write_rds(tslabels_net, "data/interim/tslabels_net.rds")
+```
+
+### Determine window and cluster size
+
+```{r, echo = FALSE, eval = FALSE}
+cfg_net <- dtwclust::compare_clusterings_configs(
+  types = "hierarchical", 
+  k = 2L:92L, 
+  controls = list(hierarchical = hierarchical_control(method = "average")), 
+  distances = pdc_configs("distance", hierarchical = list(dtw = list(window.size = seq(from = 1L, to = 11L, by = 1L), norm = c("L1")))),
+  centroids = pdc_configs("centroid", hierarchical = list(dba = list(window.size = seq(from = 1L, to = 11L, by = 1L), norm = c("L1")))),
+  preprocs = pdc_configs("preproc", hierarchical = list(zscore = list(window.size = seq(from = 1L, to = 11L, by = 1L), norm = c("L1")))),
+  no.expand = c("window.size", "norm"))
+
+comparison_net <- compare_clusterings(ts_net, 
+                                  types = "hierarchical", 
+                                  configs = cfg_net, 
+                                  seed = 8L, 
+                                  score.clus = evaluators$score, 
+                                  pick.clus = evaluators$pick)
+
+result_net <- comparison_net$results$hierarchical |> 
+  arrange(DBstar)
+
+write_rds(comparison_net, "data/interim/dtw-net-comparison.rds")
+write_rds(result_net, "data/interim/dtw-net-compresult.rds")
+```
+
+```{r, eval = FALSE, echo = FALSE}
+result_net <- read_rds("data/interim/dtw-net-compresult.rds")
+
+head(result_net)
+```
+
+### DTW clustering {.tabset}
+
+```{r, echo = FALSE}
+ts_net <- read_rds("data/interim/ts_net.rds")
+tslabels_net <- read_rds("data/interim/tslabels_net.rds")
+```
+
+#### k = 5, window = 5
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_net1 <- dtwclust::tsclust(ts_net,
+                             type = "hierarchical",
+                             k = 5,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 5), cent = dba))
+
+hc_members_net1 <- as.data.frame((ggplot_build(plot(dtw_net1, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_net, by = "group")
+
+hc_centroid_net1 <- as.data.frame((ggplot_build(plot(dtw_net1, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_net1 <- label(dendro_data(as.dendrogram(dtw_net1))) |> 
+  left_join(hc_members_net1 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_net1 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_net1) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_net1, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 3, window = 9
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_net2 <- dtwclust::tsclust(ts_net,
+                             type = "hierarchical",
+                             k = 3,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 9), cent = dba))
+
+hc_members_net2 <- as.data.frame((ggplot_build(plot(dtw_net2, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_net, by = "group")
+
+hc_centroid_net2 <- as.data.frame((ggplot_build(plot(dtw_net2, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_net2 <- label(dendro_data(as.dendrogram(dtw_net2))) |> 
+  left_join(hc_members_net2 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_net2 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_net2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_net2, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### k = 4, window = 9
+
+```{r, echo = FALSE, fig.width = 15, fig.height = 7}
+dtw_net3 <- dtwclust::tsclust(ts_net,
+                             type = "hierarchical",
+                             k = 4,
+                             preproc = zscore,
+                             distance = "dtw_basic",
+                             control = hierarchical_control(method = "average"),
+                             trace = TRUE,
+                             args = tsclust_args(dist = list(window.size = 9), cent = dba))
+
+hc_members_net3 <- as.data.frame((ggplot_build(plot(dtw_net3, type = "series", clus = c(1:10)))[["data"]])) |> 
+  left_join(tslabels_net, by = "group")
+
+hc_centroid_net3 <- as.data.frame((ggplot_build(plot(dtw_net3, type = "centroids", clus = c(1:10), lty=1))[["data"]]))
+
+labs_net3 <- label(dendro_data(as.dendrogram(dtw_net3))) |> 
+  left_join(hc_members_net3 |> dplyr::select(name, PANEL) |> distinct(), by = c("label" = "name")) |> 
+  rename(Cluster = PANEL)
+
+ggplotly(hc_members_net3 |> 
+  rename(panel2 = PANEL) |> 
+  ggplot() +
+  geom_line(aes(x = x, y = y, color = name), show.legend = FALSE) +
+  facet_wrap(~panel2) +
+  theme_bw())
+
+ggdendro::ggdendrogram(dtw_net3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "Time series hierarchical clustering", y = "Height") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_net3, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+## Comparison {.tabset}
+
+### k = 5 {.tabset}
+
+#### Dendrogram
+
+```{r, echo = FALSE, fig.width = 17, fig.height = 7}
+ggdendro::ggdendrogram(dtw_us1) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "US") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_us1, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_aus1) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "Australia") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_aus1, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_uk1) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "UK") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_uk1, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_fra1) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "France") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_fra1, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_spa1) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "Spain") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_spa1, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_swe1) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "Sweden") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_swe1, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_au1) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "Austria") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_au1, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_net1) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "Netherlands") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_net1, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### Trajectories
+
+```{r, echo = FALSE, fig.width = 17, fig.height = 7}
+dtwclust::plot(dtw_us1, type = "sc", plot = FALSE) +
+  labs(title = "United States")
+
+dtwclust::plot(dtw_aus1, type = "sc", plot = FALSE) +
+  labs(title = "Australia")
+
+dtwclust::plot(dtw_uk1, type = "sc", plot = FALSE) +
+  labs(title = "United Kingdom")
+
+dtwclust::plot(dtw_fra1, type = "sc", plot = FALSE) +
+  labs(title = "France")
+
+dtwclust::plot(dtw_spa1, type = "sc", plot = FALSE) +
+  labs(title = "Spain")
+
+dtwclust::plot(dtw_swe1, type = "sc", plot = FALSE) +
+  labs(title = "Sweden")
+
+dtwclust::plot(dtw_au1, type = "sc", plot = FALSE) +
+  labs(title = "Austria")
+
+dtwclust::plot(dtw_net1, type = "sc", plot = FALSE) +
+  labs(title = "Netherlands")
+```
+
+#### Trajectories + labels
+
+```{r, echo = FALSE, fig.width = 17, fig.height = 7}
+dtwclust::plot(dtw_us1, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "United States")
+
+dtwclust::plot(dtw_aus1, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "Australia")
+
+dtwclust::plot(dtw_uk1, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "United Kingdom")
+
+dtwclust::plot(dtw_fra1, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "France")
+
+dtwclust::plot(dtw_spa1, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "Spain")
+
+dtwclust::plot(dtw_swe1, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "Sweden")
+
+# dtwclust::plot(dtw_au1, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+#   labs(title = "Austria")
+
+dtwclust::plot(dtw_net1, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "Netherlands")
+```
+
+### k = 4 {.tabset}
+
+#### Dendrogram
+
+```{r, echo = FALSE, fig.width = 17, fig.height = 7}
+ggdendro::ggdendrogram(dtw_us3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "US") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_us3, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_aus3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "Australia") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_aus3, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_uk3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "UK") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_uk3, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_fra3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "France") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_fra3, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_spa3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "Spain") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_spa3, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_swe3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "Sweden") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_swe3, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_au3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "Austria") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_au3, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_net3) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "Netherlands") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_net3, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### Trajectories
+
+```{r, echo = FALSE, fig.width = 17, fig.height = 7}
+dtwclust::plot(dtw_us3, type = "sc", plot = FALSE) +
+  labs(title = "United States")
+
+dtwclust::plot(dtw_aus3, type = "sc", plot = FALSE) +
+  labs(title = "Australia")
+
+dtwclust::plot(dtw_uk3, type = "sc", plot = FALSE) +
+  labs(title = "United Kingdom")
+
+dtwclust::plot(dtw_fra3, type = "sc", plot = FALSE) +
+  labs(title = "France")
+
+dtwclust::plot(dtw_spa3, type = "sc", plot = FALSE) +
+  labs(title = "Spain")
+
+dtwclust::plot(dtw_swe3, type = "sc", plot = FALSE) +
+  labs(title = "Sweden")
+
+dtwclust::plot(dtw_au3, type = "sc", plot = FALSE) +
+  labs(title = "Austria")
+
+dtwclust::plot(dtw_net3, type = "sc", plot = FALSE) +
+  labs(title = "Netherlands")
+```
+
+#### Trajectories + labels
+
+```{r, echo = FALSE, fig.width = 17, fig.height = 7}
+dtwclust::plot(dtw_us3, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "United States")
+
+dtwclust::plot(dtw_aus3, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "Australia")
+
+dtwclust::plot(dtw_uk3, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "United Kingdom")
+
+dtwclust::plot(dtw_fra3, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "France")
+
+dtwclust::plot(dtw_spa3, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "Spain")
+
+dtwclust::plot(dtw_swe3, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "Sweden")
+
+# dtwclust::plot(dtw_au3, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+#   labs(title = "Austria")
+
+dtwclust::plot(dtw_net3, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "Netherlands")
+```
+
+### k = 3 {.tabset}
+
+#### Dendrogram
+
+```{r, echo = FALSE, fig.width = 17, fig.height = 7}
+ggdendro::ggdendrogram(dtw_us2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "US") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_us2, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_aus2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "Australia") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_aus2, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_uk2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "UK") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_uk2, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_fra2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "France") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_fra2, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_spa2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "Spain") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_spa2, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_swe2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "Sweden") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_swe2, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_au2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "Austria") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_au2, aes(x = x, y = 0, colour = Cluster), size = 4)
+
+ggdendro::ggdendrogram(dtw_net2) +
+  theme_bw(base_size = 18) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
+  labs(x = "", y = "", title = "Netherlands") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  geom_point(data = labs_net2, aes(x = x, y = 0, colour = Cluster), size = 4)
+```
+
+#### Trajectories
+
+```{r, echo = FALSE, fig.width = 17, fig.height = 7}
+dtwclust::plot(dtw_us2, type = "sc", plot = FALSE) +
+  labs(title = "United States")
+
+dtwclust::plot(dtw_aus2, type = "sc", plot = FALSE) +
+  labs(title = "Australia")
+
+dtwclust::plot(dtw_uk2, type = "sc", plot = FALSE) +
+  labs(title = "United Kingdom")
+
+dtwclust::plot(dtw_fra2, type = "sc", plot = FALSE) +
+  labs(title = "France")
+
+dtwclust::plot(dtw_spa2, type = "sc", plot = FALSE) +
+  labs(title = "Spain")
+
+dtwclust::plot(dtw_swe2, type = "sc", plot = FALSE) +
+  labs(title = "Sweden")
+
+dtwclust::plot(dtw_au2, type = "sc", plot = FALSE) +
+  labs(title = "Austria")
+
+dtwclust::plot(dtw_net2, type = "sc", plot = FALSE) +
+  labs(title = "Netherlands")
+```
+
+#### Trajectories + labels
+
+```{r, echo = FALSE, fig.width = 17, fig.height = 7}
+dtwclust::plot(dtw_us2, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "United States")
+
+dtwclust::plot(dtw_aus2, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "Australia")
+
+dtwclust::plot(dtw_uk2, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "United Kingdom")
+
+dtwclust::plot(dtw_fra2, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "France")
+
+dtwclust::plot(dtw_spa2, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "Spain")
+
+dtwclust::plot(dtw_swe2, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "Sweden")
+
+# dtwclust::plot(dtw_au2, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+#   labs(title = "Austria")
+
+dtwclust::plot(dtw_net2, type = "sc", labels = list(label.size = NA, fill = NA), plot = FALSE) +
+  labs(title = "Netherlands")
+```
