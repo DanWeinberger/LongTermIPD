@@ -133,23 +133,26 @@ tslabels_us <- tibble(name = names(ts_us),
 # write_rds(tslabels_us, "data/interim/tslabels_us.rds")
 ```
 
-```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+```{r, echo = FALSE, fig.width = 9, fig.height = 9}
 us2 |> 
   enframe() |> 
   unnest(cols = c(value)) |> 
-  filter(year >= 2010) |> 
+  filter(year >= 2010 & name != "9A") |> 
   #left_join(smooth_us |> enframe() |> unnest(cols = c(value)) |> filter(success == 1), by = c("name", "nyear")) |> 
   ggplot(aes(x = as.integer(year), y = N_IPD)) +
   geom_vline(aes(xintercept = 2010, color = "PCV13 introduced"), lty = 2) +
   scale_color_manual(values = c("PCV13 introduced" = "red")) +
   geom_line() +
   #geom_line(aes(y = fitcases), color = "red") +
-  facet_wrap(~name, scales = "free_y") +
+  facet_wrap(~name, scales = "free_y", ncol = 6) +
   scale_x_continuous(breaks = c(2010, 2015, 2020)) +
   labs(x = "", y = "IPD cases", color = "") +
   theme_bw() +
   theme(legend.position = "inside",
-        legend.position.inside = c(0.93,0.07))
+        legend.position.inside = c(0.9,0.07),
+        text = element_text(size = 16),
+        legend.background = element_blank(), 
+        legend.box.background = element_blank())
 ```
 
 ### DTW clustering {.tabset}
@@ -533,10 +536,11 @@ ggplotly(hc_members_us_cut2 |>
   theme_bw())
 
 ggdendro::ggdendrogram(dtw_us_cut2) +
-  theme_bw(base_size = 18) +
-  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
-  labs(x = "Time series hierarchical clustering", y = "Height") +
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  theme_bw() +
+  labs(x = "", y = "") +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        text = element_text(size = 20)) + 
   geom_point(data = labs_us_cut2, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
 ```
 
@@ -820,7 +824,7 @@ tslabels_aus <- tibble(name = names(ts_aus),
 # write_rds(tslabels_aus, "data/interim/tslabels_aus.rds")
 ```
 
-```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+```{r, echo = FALSE, fig.width = 9, fig.height = 9}
 aus2 |> 
   enframe() |> 
   unnest(cols = c(value)) |> 
@@ -830,12 +834,14 @@ aus2 |>
   scale_color_manual(values = c("PCV13 introduced" = "red")) +
   geom_line() +
   #geom_line(aes(y = fitcases), color = "red") +
-  facet_wrap(~name, scales = "free_y") +
+  facet_wrap(~name, scales = "free_y", ncol = 5) +
   scale_x_continuous(breaks = c(2010, 2015, 2020)) +
   labs(x = "", y = "IPD cases", color = "") +
   theme_bw() +
   theme(legend.position = "inside",
-        legend.position.inside = c(0.93,0.07))
+        legend.position.inside = c(0.9,0.07),
+        text = element_text(size = 16),
+        legend.background = element_blank())
 ```
 
 ### DTW clustering {.tabset}
@@ -882,10 +888,11 @@ ggplotly(hc_members_aus2 |>
   theme_bw())
 
 ggdendro::ggdendrogram(dtw_aus2) +
-  theme_bw(base_size = 18) +
-  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
-  labs(x = "Time series hierarchical clustering", y = "Height") +
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  theme_bw() +
+  labs(x = "", y = "") +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        text = element_text(size = 20)) + 
   geom_point(data = labs_aus2, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
 ```
 
@@ -1192,7 +1199,7 @@ tslabels_uk <- tibble(name = names(ts_uk),
 # write_rds(tslabels_uk, "data/interim/tslabels_uk.rds")
 ```
 
-```{r, echo = FALSE, fig.width = 12, fig.height = 7}
+```{r, echo = FALSE, fig.width = 9, fig.height = 9}
 uk2 |> 
   enframe() |> 
   unnest(cols = c(value)) |> 
@@ -1203,12 +1210,14 @@ uk2 |>
   scale_color_manual(values = c("PCV13 introduced" = "red")) +
   geom_line() +
   #geom_line(aes(y = fitcases), color = "red") +
-  facet_wrap(~name, scales = "free_y") +
+  facet_wrap(~name, scales = "free_y", ncol = 5) +
   scale_x_continuous(breaks = c(2010, 2015, 2020)) +
   labs(x = "", y = "IPD cases", color = "") +
   theme_bw() +
   theme(legend.position = "inside",
-        legend.position.inside = c(0.93,0.07))
+        legend.position.inside = c(0.9,0.07),
+        text = element_text(size = 16),
+        legend.background = element_blank())
 ```
 
 ### DTW clustering {.tabset}
@@ -1255,11 +1264,11 @@ ggplotly(hc_members_uk2 |>
   theme_bw())
 
 ggdendro::ggdendrogram(dtw_uk2) +
-  theme_bw(base_size = 18) +
-  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
-  labs(x = "Time series hierarchical clustering", y = "Height") +
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
-        legend.position = "bottom") + 
+  theme_bw() +
+  labs(x = "", y = "") +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        text = element_text(size = 20)) + 
   geom_point(data = labs_uk2, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
 ```
 
@@ -1534,6 +1543,23 @@ spa <- eur |>
   dplyr::select(st, N_IPD, nyear) |> 
   nest(.by = "st") |> 
   deframe()
+
+spa2 <- eur |> 
+  filter(country == "Spain") |> 
+  select(-country) |> 
+  #complete(year, st, fill = list(N_IPD = 0)) |> 
+  filter(st != "NTYP") |> 
+  arrange(year) |> 
+  group_by(st) |> 
+  mutate(nyear = row_number(),
+         tot_cases = sum(N_IPD),
+         numb_year = length(unique(nyear))) |> 
+  ungroup() |> 
+  filter(tot_cases > 50,
+         numb_year == 11) |>
+  dplyr::select(st, N_IPD, year) |> 
+  nest(.by = "st") |> 
+  deframe()
 ```
 
 ### Smooth with p-splines
@@ -1596,17 +1622,24 @@ tslabels_spa <- tibble(name = names(ts_spa),
 # write_rds(tslabels_spa, "data/interim/tslabels_spa.rds")
 ```
 
-```{r, echo = FALSE, fig.width = 12, fig.height = 7}
-spa |> 
+```{r, echo = FALSE, fig.width = 9, fig.height = 9.5}
+spa2 |> 
   enframe() |> 
   unnest(cols = c(value)) |> 
   filter(N_IPD != 0) |> 
-  left_join(smooth_spa |> enframe() |> unnest(cols = c(value)) |> filter(success == 1), by = c("name", "nyear")) |> 
-  ggplot(aes(x = nyear, y = N_IPD)) +
+  #left_join(smooth_uk |> enframe() |> unnest(cols = c(value)) |> filter(success == 1), by = c("name", "nyear")) |> 
+  ggplot(aes(x = as.integer(year), y = N_IPD)) +
+  geom_vline(aes(xintercept = 2010, color = "PCV10/13 introduced"), lty = 2) +
+  scale_color_manual(values = c("PCV10/13 introduced" = "red")) +
   geom_line() +
-  geom_line(aes(y = fitcases), color = "red") +
-  facet_wrap(~name, scales = "free_y") +
-  theme_bw()
+  #geom_line(aes(y = fitcases), color = "red") +
+  facet_wrap(~name, scales = "free_y", ncol = 5) +
+  scale_x_continuous(breaks = c(2010, 2015, 2020)) +
+  labs(x = "", y = "IPD cases", color = "") +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        text = element_text(size = 16),
+        legend.background = element_blank())
 ```
 
 ### DTW clustering {.tabset}
@@ -1653,11 +1686,11 @@ ggplotly(hc_members_spa2 |>
   theme_bw())
 
 ggdendro::ggdendrogram(dtw_spa2) +
-  theme_bw(base_size = 18) +
-  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
-  labs(x = "Time series hierarchical clustering", y = "Height") +
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
-        legend.position = "bottom") + 
+  theme_bw() +
+  labs(x = "", y = "") +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        text = element_text(size = 20)) + 
   geom_point(data = labs_spa2, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
 ```
 
@@ -2567,18 +2600,18 @@ ger2 <- ger_raw |>
   dplyr::select(st, N_IPD, year)
 ```
 
-```{r, fig.width = 12, fig.height = 7}
+```{r, fig.width = 9, fig.height = 9.5}
 ger2 |> 
   ggplot(aes(x = as.integer(year), y = N_IPD)) +
   geom_vline(aes(xintercept = 2009, color = "PCV13 introduced"), lty = 2) +
   scale_color_manual(values = c("PCV13 introduced" = "red")) +
   geom_line() +
-  facet_wrap(~st, scales = "free_y") +
+  facet_wrap(~st, scales = "free_y", ncol = 5) +
   scale_x_continuous(breaks = c(2010, 2015, 2020)) +
   labs(x = "", y = "IPD cases", color = "") +
   theme_bw() +
-  theme(legend.position = "inside",
-        legend.position.inside = c(0.93,0.07))
+  theme(legend.position = "bottom",
+        text = element_text(size = 16))
 ```
 
 ### DTW clustering
@@ -2626,8 +2659,9 @@ ggplotly(hc_members_ger2 |>
 
 ggdendro::ggdendrogram(dtw_ger2) +
   theme_bw(base_size = 18) +
-  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2)) +
-  labs(x = "Time series hierarchical clustering", y = "Height") +
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+  labs(x = "", y = "") +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 2),
+        text = element_text(size = 20),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
   geom_point(data = labs_ger2, aes(x = x, y = 0, color = Cluster, shape = Vaccine), size = 4)
 ```

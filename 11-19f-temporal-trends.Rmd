@@ -118,7 +118,7 @@ reactable(data_19F |>
                          ratio_prop = colDef(name = "Ratio of proportions", format = colFormat(digits = 2))), defaultPageSize = 14)
 ```
 
-```{r, fig.width = 10, fig.height = 5, message = FALSE}
+```{r, fig.width = 12, fig.height = 6, message = FALSE}
 vax_years <- read_csv("data/vax-intro-years.csv") |> 
   mutate(label = factor(label, levels = c("PCV7", "PCV10", "PCV13")))
 
@@ -127,8 +127,9 @@ db_19F |>
   ggplot(aes(x = year, y = IPD_19F, color = country)) +
   geom_line(lwd = 1) +
   scale_x_continuous(breaks = c(2010:2022)) +
-  labs(x = "", y = "19F IPD cases", color = "") +
-  theme_bw()
+  labs(x = "", y = "# IPD cases due to 19F", color = "") +
+  theme_bw() +
+  theme(text = element_text(size = 16))
 
 db_19F |> 
   filter(year >= 2010) |> 
@@ -136,7 +137,8 @@ db_19F |>
   geom_line(lwd = 1) +
   scale_x_continuous(breaks = c(2010:2022)) +
   labs(x = "", y = "19F IPD cases/total IPD cases", color = "") +
-  theme_bw()
+  theme_bw() +
+  theme(text = element_text(size = 16))
 
 db_19F |> 
   filter(year < 2020) |> 
@@ -147,8 +149,9 @@ db_19F |>
   geom_line(aes(color = country), lwd = 1, show.legend = FALSE) +
   scale_x_continuous(breaks = c(2000, 2005, 2010, 2015, 2020)) +
   facet_wrap(~country, scales = "free_y") +
-  labs(x = "", y = "19F IPD cases", color = "") +
-  theme_bw()
+  labs(x = "", y = "# IPD cases due to 19F", color = "") +
+  theme_bw() +
+  theme(text = element_text(size = 16))
 
 db_19F |> 
   filter(year < 2020) |> 
@@ -160,7 +163,25 @@ db_19F |>
   scale_x_continuous(breaks = c(2000, 2005, 2010, 2015, 2020)) +
   facet_wrap(~country, scales = "free_y") +
   labs(x = "", y = "19F IPD cases/total IPD cases", color = "") +
-  theme_bw()
+  theme_bw() +
+  theme(text = element_text(size = 16))
+```
+
+```{r, fig.width = 8, fig.height = 9}
+db_19F |> 
+  filter(year < 2020) |> 
+  ggplot(aes(x = year, y = IPD_19F)) +
+  geom_vline(data = vax_years, aes(xintercept = year, color = label), lty = 2) +
+  scale_color_manual(values = c("PCV7" = "black", "PCV10" = "blue", "PCV13" = "red"), name = "") +
+  ggnewscale::new_scale_color() +
+  geom_line(aes(color = country), lwd = 1, show.legend = FALSE) +
+  scale_x_continuous(breaks = c(2000, 2005, 2010, 2015, 2020)) +
+  facet_wrap(~country, scales = "free_y", ncol = 3) +
+  labs(x = "", y = "# IPD cases due to 19F", color = "") +
+  theme_bw() +
+  theme(text = element_text(size = 16),
+        legend.position = "inside",
+        legend.position.inside = c(0.83, 0.1))
 ```
 
 ```{r}

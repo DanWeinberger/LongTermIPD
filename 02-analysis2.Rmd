@@ -46,6 +46,27 @@ data <- data_raw |>
                               .default = ""))
 ```
 
+```{r}
+data |> 
+  filter(pcv7 == 1 & year < 2011) |> 
+  ggplot() +
+  geom_vline(aes(xintercept = 2000), color = "red", lty = 2) +
+  geom_line(aes(x = year, y = N_IPD, color = st), lwd = 1, show.legend = FALSE) +
+  theme_bw() +
+  labs(x = "", y = "# IPD cases", color = "", title = "PCV7 serotypes") +
+  theme(text = element_text(size = 16),
+        legend.position = "bottom")
+
+data |> 
+  filter(pcv7 == 0 & year < 2011) |> 
+  ggplot() +
+  geom_vline(aes(xintercept = 2000), color = "red", lty = 2) +
+  geom_line(aes(x = year, y = N_IPD, color = st), lwd = 1, show.legend = FALSE) +
+  theme_bw() +
+  labs(x = "", y = "# IPD cases", title = "Non-PCV7 serotypes") +
+  theme(text = element_text(size = 16))
+```
+
 ## 1: Only PCV-7 serotypes
 
 ### Wrangle data
