@@ -627,37 +627,18 @@ plot_bym <- function(result, shapefile) {
   n <- nrow(result$summary.random$idarea)
   split_point <- n / 2
   
-  bym_st_result <- shapefile |> 
+  bym_result <- shapefile |> 
     cbind(result$summary.random$idarea[1:split_point, ]) |> 
-    mutate(sig = case_when(
-      X0.025quant > 0 & X0.975quant > 0 ~ 1,
-      X0.025quant < 0 & X0.975quant < 0 ~ 1,
-      .default = 0
-    ))
+    mutate(sig = case_when(X0.025quant > 0 & X0.975quant > 0 ~ 1,
+                           X0.025quant < 0 & X0.975quant < 0 ~ 1,
+                           .default = 0))
   
-  structured_plot <- bym_st_result |> 
+  bym_result |> 
     ggplot() +
     geom_sf(aes(fill = exp(mean)), color = NA) +
     scale_fill_viridis_c() +
-    labs(title = "Structured Effects", fill = "Effect") +
+    labs(fill = "Effect") +
     theme_void()
-  
-  bym_unst_result <- shapefile |> 
-    cbind(result$summary.random$idarea[(split_point + 1):n, ]) |> 
-    mutate(sig = case_when(
-      X0.025quant > 0 & X0.975quant > 0 ~ 1,
-      X0.025quant < 0 & X0.975quant < 0 ~ 1,
-      .default = 0
-    ))
-  
-  unstructured_plot <- bym_unst_result |> 
-    ggplot() +
-    geom_sf(aes(fill = exp(mean)), color = NA) +
-    scale_fill_viridis_c() +
-    labs(title = "Unstructured Effects", fill = "Effect") +
-    theme_void()
-  
-  plot_grid(structured_plot, unstructured_plot, ncol = 2)
 }
 
 # plot ar1
