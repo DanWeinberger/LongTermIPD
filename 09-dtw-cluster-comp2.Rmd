@@ -2554,7 +2554,7 @@ PCV-13 introduced in 2009
 ger_raw <- read_csv("data/DE_IPD_deidentified.csv")
 
 ger <- ger_raw |> 
-  mutate(date = as.Date(DateOfIsolation, format = "%d/%m/%Y"),
+  mutate(date = as.Date(DateOfIsolation, format = "%m/%d/%Y"),
          year = year(date),
          st = str_to_upper(Serotype),
          st = case_when(st == "6B OLD" ~ "6B",
@@ -2578,7 +2578,7 @@ ger <- ger_raw |>
   deframe()
 
 ger2 <- ger_raw |> 
-  mutate(date = as.Date(DateOfIsolation, format = "%d/%m/%Y"),
+  mutate(date = as.Date(DateOfIsolation, format = "%m/%d/%Y"),
          year = year(date),
          st = str_to_upper(Serotype),
          st = case_when(st == "6B OLD" ~ "6B",

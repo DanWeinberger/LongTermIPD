@@ -51,7 +51,7 @@ vax_cov <- readxl::read_xlsx("data/kvis_vax.xlsx")
 #   st_intersection(x, y_subset)
 # }
 # 
-# intersection_pre <- st_intersection_faster(ger_shp, ger_shp_plz)
+# intersection_pre <- st_intersection_faster(ger_shp, shp)
 # 
 # intersection <- intersection_pre |>
 #   mutate(intersection_area = st_area(geometry),
@@ -97,7 +97,7 @@ dpt <- vax_cov |>
   mutate(new_pop = pop_weight*overlap_percentage,
          vaxed_1d = new_pop*(`1. Dosis`/100),
          vaxed_3d = new_pop*(`3. Dosis`/100),
-         year = year_birth+2,
+         year = year_birth+1,
          nyeargroup = cut(year, breaks = c(2008, 2012, 2017, 2022), include.lowest = TRUE, labels = FALSE)) |> 
   group_by(plz, nyeargroup) |> 
   summarise(dpt_vax1d_pop = as.numeric(sum(vaxed_1d, na.rm = TRUE)),
@@ -110,11 +110,11 @@ dpt <- vax_cov |>
   
 # join vaccine and IPD datasets
 data_full <- ipd_raw |> 
-  mutate(date = as.Date(DateOfIsolation, format = "%d/%m/%Y"),
+  mutate(date = as.Date(DateOfIsolation, format = "%m/%d/%Y"),
          plz_pre = str_pad(PLZpatient, side = "left", pad = "0", width = 3),
          plz = substr(plz_pre, 1, 2),
          year = year(date)) |> 
-  filter(!is.na(PLZpatient) & date > as.Date("2009-01-01")) |> 
+  filter(!is.na(PLZpatient) & date > as.Date("2009-01-01") & !is.na(date) & !(plz %in% c("05", "11"))) |> 
   arrange(year) |> 
   group_by(year) |> 
   mutate(nyear = cur_group_id()) |> 
@@ -166,6 +166,33 @@ data_full_sf <- shp |>
 - `dpt_vacc_cat` (numeric): categorical version of dpt_vacc_rate
 
 ## Visualize data
+
+### Cases
+
+```{r}
+case_db <- ipd_raw |> 
+  filter(!is.na(DateOfIsolation) & !is.na(agey) & !is.na(Serotype)) |> 
+  mutate(ageg = cut(agey, breaks = c(0, 5, 10, 20, 50, 150), include.lowest = TRUE),
+         year = year(as.Date(DateOfIsolation, format = "%m/%d/%Y"))) |> 
+  group_by(year, ageg, Serotype) |> 
+  summarise(ipd_st = n()) |> 
+  group_by(year, ageg) |> 
+  mutate(ipd_total = sum(ipd_st)) |> 
+  ungroup()
+
+case_db |> 
+  ggplot(aes(x = year, y = ipd_total, color = ageg)) +
+  geom_line() +
+  labs(x = "", y = "Total IPD cases", color = "Age group") +
+  theme_bw()
+
+case_db |> 
+  filter(Serotype == "19F") |> 
+  ggplot(aes(x = year, y = ipd_st, color = ageg)) +
+  geom_line() +
+  labs(x = "", y = "19F IPD cases", color = "Age group") +
+  theme_bw()
+```
 
 ### Scatterplots
 
