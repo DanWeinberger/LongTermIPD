@@ -109,6 +109,9 @@ dpt <- vax_cov |>
   select(plz, nyeargroup, dpt_vacc_rate, dpt_vacc_cat)
   
 # join vaccine and IPD datasets
+pcv7_st <- c("4","6B","9V","14","18C","19F","23F")
+pcv7_no19f <- c("4","6B","9V","14","18C","23F")
+
 data_full <- ipd_raw |> 
   mutate(date = as.Date(DateOfIsolation, format = "%m/%d/%Y"),
          plz_pre = str_pad(PLZpatient, side = "left", pad = "0", width = 3),
@@ -124,15 +127,14 @@ data_full <- ipd_raw |>
   group_by(plz, Serotype, yeargroup, nyeargroup) |> 
   summarise(ipd_st = n()) |> 
   group_by(plz, yeargroup, nyeargroup) |> 
-  mutate(ipd = sum(ipd_st)) |> 
+  mutate(ipd = sum(ipd_st),
+         ipd_pcv7 = sum(ipd_st[Serotype %in% pcv7_no19f], na.rm = TRUE)) |> 
   ungroup() |> 
-  filter(Serotype == "19F" | Serotype == "19A") |> 
+  filter(Serotype %in% pcv7_st | Serotype == "19A") |> 
   pivot_wider(names_from = Serotype, names_prefix = "ipd_", values_from = ipd_st) |> 
-  mutate(ipd_19F = if_else(is.na(ipd_19F), 0, ipd_19F),
-         ipd_19A = if_else(is.na(ipd_19A), 0, ipd_19A),
-         ratio_19F = ipd_19F/ipd,
-         ratio_19A = ipd_19A/ipd,
-         logit_19A = log((ratio_19A+0.001)/(1-ratio_19A+0.001))) |> 
+  mutate(across(starts_with("ipd_"), ~ if_else(is.na(.x), 0, .x)), 
+         across(starts_with("ipd_"), ~ .x / ipd, .names = "ratio_{.col}"),
+         across(starts_with("ratio_ipd_"), ~ log((.x + 0.001) / (1 - .x + 0.001)), .names = "logit_{.col}")) |> 
   left_join(vax_cov_agg, by = c("plz", "nyeargroup")) |> 
   group_by(yeargroup) |> 
   mutate(meancov = mean(vacc_rate, na.rm = TRUE)) |> 
@@ -155,9 +157,11 @@ data_full_sf <- shp |>
 - `ipd` (numeric): total number of IPD cases for each area and period
 - `ipd_19F` (numeric): number of 19F IPD for each area and period
 - `ipd_19A` (numeric): number of 19A IPD cases for each area and period
-- `ratio_19F` (numeric): ipd_19F/ipd
-- `ratio_19A` (numeric): ipd_19A/ipd
-- `logit_19A` (numeric): log((ratio_19A+0.001)/(1-ratio_19A+0.001))
+- ... for all other included serotypes
+- `ratio_ipd_19F` (numeric): ipd_19F/ipd
+- `ratio_ipd_19A` (numeric): ipd_19A/ipd
+- ... for all other included serotypes
+- `logit_19A` (numeric): log((ratio_ipd_19A+0.001)/(1-ratio_ipd_19A+0.001))
 - `vacc_rate` (numeric): PCV vaccination coverage for each area and period (0-1)
 - `vacc_cat` (numeric): categorical version of vacc_rate to use as nonlinear effect in INLA (created using inla.group(vacc_rate, n = 10, method = "quantile"))
 - `vacc_rate_d` (numeric): delta from mean vaccination coverage for that period
@@ -199,7 +203,7 @@ case_db |>
 ```{r, fig.width = 11, fig.height = 4}
 # 19F vs % vaccinated
 data_full_sf |> 
-  ggplot(aes(x = vacc_rate, y = ratio_19F)) +
+  ggplot(aes(x = vacc_rate, y = ratio_ipd_19F)) +
   geom_point(aes(size = ipd), alpha = 0.5, shape = 16) +
   #geom_smooth() +
   labs(size = "Total IPD cases") +
@@ -211,7 +215,7 @@ data_full_sf |>
 
 # 19F vs % DPT vaccinated
 data_full_sf |> 
-  ggplot(aes(x = dpt_vacc_rate, y = ratio_19F)) +
+  ggplot(aes(x = dpt_vacc_rate, y = ratio_ipd_19F)) +
   geom_point(aes(size = ipd), alpha = 0.5, shape = 16) +
   #geom_smooth() +
   labs(size = "Total IPD cases") +
@@ -223,7 +227,7 @@ data_full_sf |>
 
 # 19F vs 19A
 data_full_sf |> 
-  ggplot(aes(x = ratio_19A, y = ratio_19F)) +
+  ggplot(aes(x = ratio_ipd_19A, y = ratio_ipd_19F)) +
   geom_point(aes(size = ipd), alpha = 0.5, shape = 16) +
   #geom_smooth() +
   labs(size = "Total IPD cases") +
@@ -252,7 +256,7 @@ data_full_sf |>
 data_full_sf |> 
   ggplot() +
   geom_sf(data = shp, fill = "lightgray", color = NA) +
-  geom_sf(aes(fill = ratio_19F), color = NA) +
+  geom_sf(aes(fill = ratio_ipd_19F), color = NA) +
   scale_fill_viridis_c(option = "C") +
   facet_wrap(~yeargroup) +
   labs(fill = "Proportion\n19F cases\n") +
@@ -263,7 +267,7 @@ data_full_sf |>
 data_full_sf |> 
   ggplot() +
   geom_sf(data = shp, fill = "lightgray", color = NA) +
-  geom_sf(aes(fill = ratio_19A), color = NA) +
+  geom_sf(aes(fill = ratio_ipd_19A), color = NA) +
   scale_fill_viridis_c(option = "C") +
   facet_wrap(~yeargroup) +
   labs(fill = "Proportion\n19A cases") +
@@ -299,7 +303,7 @@ data_full_sf |>
 
 ```{r, fig.width = 11}
 # 19F vs % PCV vaccinated
-biv_dat1 <- bi_class(data_full_sf, x = vacc_rate, y = ratio_19F, style = "fisher", dim = 3)
+biv_dat1 <- bi_class(data_full_sf, x = vacc_rate, y = ratio_ipd_19F, style = "fisher", dim = 3)
 
 biv_map1 <- biv_dat1 |> 
   ggplot() +
@@ -339,7 +343,7 @@ biv_leg2 <- bi_legend(pal = "GrPink",
 plot_grid(biv_map2, biv_leg2, ncol = 2, rel_widths = c(1, 0.25))
 
 # 19F vs 19A
-biv_dat3 <- bi_class(data_full_sf, x = ratio_19A, y = ratio_19F, style = "fisher", dim = 3)
+biv_dat3 <- bi_class(data_full_sf, x = ratio_ipd_19A, y = ratio_ipd_19F, style = "fisher", dim = 3)
 
 biv_map3 <- biv_dat3 |> 
   ggplot() +
@@ -431,10 +435,10 @@ plot_grid(biv_map9, biv_leg9, ncol = 2, rel_widths = c(1, 0.25))
 ```{r, fig.width = 11}
 # 19F vs % PCV vaccinated
 biv_dat4 <- data_full_sf |> 
-  mutate(inv_19F = 1-ratio_19F) |> 
+  mutate(inv_19F = 1-ratio_ipd_19F) |> 
   group_by(yeargroup) |> 
   mutate(quant_x = cut(vacc_rate, breaks = cartography::getBreaks(vacc_rate, method = "fisher", nclass = 3), include.lowest = TRUE, labels = c(1, 2, 3)),
-         quant_y = cut(ratio_19F, breaks = cartography::getBreaks(ratio_19F, method = "fisher", nclass = 3), include.lowest = TRUE, labels = c(3, 2, 1)),
+         quant_y = cut(ratio_ipd_19F, breaks = cartography::getBreaks(ratio_ipd_19F, method = "fisher", nclass = 3), include.lowest = TRUE, labels = c(3, 2, 1)),
          bi_class = paste(quant_x, quant_y, sep = "-"))
 
 biv_map4 <- biv_dat4 |> 
@@ -456,10 +460,10 @@ plot_grid(biv_map4, biv_leg4, ncol = 2, rel_widths = c(1, 0.25))
 
 # 19F vs % DPT vaccinated
 biv_dat5 <- data_full_sf |> 
-  mutate(inv_19F = 1-ratio_19F) |> 
+  mutate(inv_19F = 1-ratio_ipd_19F) |> 
   group_by(yeargroup) |> 
   mutate(quant_x = cut(dpt_vacc_rate, breaks = cartography::getBreaks(dpt_vacc_rate, method = "fisher", nclass = 3), include.lowest = TRUE, labels = c(1, 2, 3)),
-         quant_y = cut(ratio_19F, breaks = cartography::getBreaks(ratio_19F, method = "fisher", nclass = 3), include.lowest = TRUE, labels = c(3, 2, 1)),
+         quant_y = cut(ratio_ipd_19F, breaks = cartography::getBreaks(ratio_ipd_19F, method = "fisher", nclass = 3), include.lowest = TRUE, labels = c(3, 2, 1)),
          bi_class = paste(quant_x, quant_y, sep = "-"))
 
 biv_map5 <- biv_dat5 |> 
@@ -481,10 +485,10 @@ plot_grid(biv_map5, biv_leg5, ncol = 2, rel_widths = c(1, 0.25))
 
 # 19F vs 19A
 biv_dat6 <- data_full_sf |> 
-  mutate(inv_19F = 1-ratio_19F) |> 
+  mutate(inv_19F = 1-ratio_ipd_19F) |> 
   group_by(yeargroup) |> 
-  mutate(quant_x = cut(ratio_19A, breaks = cartography::getBreaks(ratio_19A, method = "fisher", nclass = 3), include.lowest = TRUE, labels = c(1, 2, 3)),
-         quant_y = cut(ratio_19F, breaks = cartography::getBreaks(ratio_19F, method = "fisher", nclass = 3), include.lowest = TRUE, labels = c(3, 2, 1)),
+  mutate(quant_x = cut(ratio_ipd_19A, breaks = cartography::getBreaks(ratio_ipd_19A, method = "fisher", nclass = 3), include.lowest = TRUE, labels = c(1, 2, 3)),
+         quant_y = cut(ratio_ipd_19F, breaks = cartography::getBreaks(ratio_ipd_19F, method = "fisher", nclass = 3), include.lowest = TRUE, labels = c(3, 2, 1)),
          bi_class = paste(quant_x, quant_y, sep = "-"))
 
 biv_map6 <- biv_dat6 |> 
@@ -578,8 +582,22 @@ adj_mat <- inla.read.graph(filename = "map.adj")
 runmod <- function(data, 
                    cases_19F = "ipd_19F", 
                    cases_19A = "ipd_19A", 
-                   ratio_19A = "ratio_19A",
-                   logit_19A = "logit_19A",
+                   ratio_ipd_19A = "ratio_ipd_19A",
+                   ratio_ipd_23F = "ratio_ipd_23F",
+                   ratio_ipd_14 = "ratio_ipd_14",
+                   ratio_ipd_18C = "ratio_ipd_18C",
+                   ratio_ipd_6B = "ratio_ipd_6B",
+                   ratio_ipd_9V = "ratio_ipd_9V",
+                   ratio_ipd_4 = "ratio_ipd_4",
+                   ratio_ipd_pcv7 = "ratio_ipd_pcv7",
+                   logit_ratio_ipd_19A = "logit_ratio_ipd_19A",
+                   logit_ratio_ipd_23F = "logit_ratio_ipd_23F",
+                   logit_ratio_ipd_14 = "logit_ratio_ipd_14",
+                   logit_ratio_ipd_18C = "logit_ratio_ipd_18C",
+                   logit_ratio_ipd_6B = "logit_ratio_ipd_6B",
+                   logit_ratio_ipd_9V = "logit_ratio_ipd_9V",
+                   logit_ratio_ipd_4 = "logit_ratio_ipd_4",
+                   logit_ratio_ipd_pcv7 = "logit_ratio_ipd_pcv7",
                    N = "ipd", 
                    idarea = "idarea", 
                    vacc_rate = "vacc_rate", 
@@ -594,8 +612,22 @@ runmod <- function(data,
   data_inla <- list(
     cases_19F = data[[cases_19F]],
     cases_19A = data[[cases_19A]],
-    ratio_19A = data[[ratio_19A]],
-    logit_19A = data[[logit_19A]],
+    ratio_ipd_19A = data[[ratio_ipd_19A]],
+    ratio_ipd_23F = data[[ratio_ipd_23F]],
+    ratio_ipd_14 = data[[ratio_ipd_14]],
+    ratio_ipd_18C = data[[ratio_ipd_18C]],
+    ratio_ipd_6B = data[[ratio_ipd_6B]],
+    ratio_ipd_9V = data[[ratio_ipd_9V]],
+    ratio_ipd_4 = data[[ratio_ipd_4]],
+    ratio_ipd_pcv7 = data[[ratio_ipd_pcv7]],
+    logit_ratio_ipd_19A = data[[logit_ratio_ipd_19A]],
+    logit_ratio_ipd_23F = data[[logit_ratio_ipd_23F]],
+    logit_ratio_ipd_14 = data[[logit_ratio_ipd_14]],
+    logit_ratio_ipd_18C = data[[logit_ratio_ipd_18C]],
+    logit_ratio_ipd_6B = data[[logit_ratio_ipd_6B]],
+    logit_ratio_ipd_9V = data[[logit_ratio_ipd_9V]],
+    logit_ratio_ipd_4 = data[[logit_ratio_ipd_4]],
+    logit_ratio_ipd_pcv7 = data[[logit_ratio_ipd_pcv7]],
     total_cases = data[[N]],
     N = data[[N]],
     idarea = data[[idarea]],
@@ -669,7 +701,7 @@ plot_lp <- function(result, var_name, data, label = NULL) {
   effect_df |> 
     ggplot(aes(x = predictor, y = effect)) +
     #geom_hline(aes(yintercept = 1), lty = 2, color = "red") +
-    geom_line(size = 1) +
+    geom_line(linewidth = 1) +
     geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2) +
     labs(x = label %||% predictor_name, y = "Effect") +
     theme_bw()
@@ -695,6 +727,7 @@ plot_nlp <- function(result, var_name, label = NULL) {
 
 ```{r}
 base_f <- "cases_19F ~ 1 + f(idarea, model = 'bym2', graph = adj_mat) + f(t, model = 'ar1')"
+
 base_mod <- runmod(data = data_full_sf, formula = base_f)
 
 summary(base_mod)
@@ -761,30 +794,30 @@ plot_lp(data = data_full, result = mod5, var_name = "dpt_vacc_rate", label = "DP
 ### 19A proportion (linear)
 
 ```{r}
-f6 <- "cases_19F ~ 1 + f(idarea, model = 'bym2', graph = adj_mat) + f(t, model = 'ar1') + ratio_19A"
+f6 <- "cases_19F ~ 1 + f(idarea, model = 'bym2', graph = adj_mat) + f(t, model = 'ar1') + ratio_ipd_19A"
 
 mod6 <- runmod(data = data_full_sf, formula = f6)
 
 summary(mod6)
 plot_bym(result = mod6, shapefile = shp)
 plot_ar1(result = mod6, time_mapping = data_full |> dplyr::select(nyeargroup, yeargroup) |> distinct())
-plot_lp(data = data_full, result = mod6, var_name = "ratio_19A", label = "Ratio 19A")
+plot_lp(data = data_full, result = mod6, var_name = "ratio_ipd_19A", label = "Proportion 19A")
 ```
 
 ```{r}
-f7 <- "cases_19F ~ 1 + f(idarea, model = 'bym2', graph = adj_mat) + f(t, model = 'ar1') + logit_19A"
+f7 <- "cases_19F ~ 1 + f(idarea, model = 'bym2', graph = adj_mat) + f(t, model = 'ar1') + logit_ratio_ipd_19A"
 
 mod7 <- runmod(data = data_full_sf, formula = f7)
 
 summary(mod7)
 plot_bym(result = mod7, shapefile = shp)
 plot_ar1(result = mod7, time_mapping = data_full |> dplyr::select(nyeargroup, yeargroup) |> distinct())
-plot_lp(data = data_full, result = mod7, var_name = "logit_19A", label = "logit(Proportion 19A)")
+plot_lp(data = data_full, result = mod7, var_name = "logit_ratio_ipd_19A", label = "logit(Proportion 19A)")
 
-data.frame(predictor = seq(min(data_full$logit_19A, na.rm = TRUE), max(data_full$logit_19A, na.rm = TRUE), length.out = 100)) |> 
-  mutate(effect = 1 / (1 + exp(-mod7$summary.fixed["logit_19A", ]$mean * predictor)),
-         lower = 1/ (1 + exp(-mod7$summary.fixed["logit_19A", ]$`0.025quant` * predictor)),
-         upper = 1/ (1 + exp(-mod7$summary.fixed["logit_19A", ]$`0.975quant` * predictor))) |> 
+data.frame(predictor = seq(min(data_full$logit_ratio_ipd_19A, na.rm = TRUE), max(data_full$logit_ratio_ipd_19A, na.rm = TRUE), length.out = 100)) |> 
+  mutate(effect = 1 / (1 + exp(-mod7$summary.fixed["logit_ratio_ipd_19A", ]$mean * predictor)),
+         lower = 1/ (1 + exp(-mod7$summary.fixed["logit_ratio_ipd_19A", ]$`0.025quant` * predictor)),
+         upper = 1/ (1 + exp(-mod7$summary.fixed["logit_ratio_ipd_19A", ]$`0.975quant` * predictor))) |> 
     ggplot(aes(x = exp(predictor), y = effect)) +
     geom_line(size = 1) +
     geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2) +
@@ -793,15 +826,158 @@ data.frame(predictor = seq(min(data_full$logit_19A, na.rm = TRUE), max(data_full
     theme_bw()
 ```
 
+### Other PCV7 serotypes
+
+```{r}
+f8 <- "cases_19F ~ 1 + f(idarea, model = 'bym2', graph = adj_mat) + f(t, model = 'ar1') + logit_ratio_ipd_pcv7"
+
+mod8 <- runmod(data = data_full_sf, formula = f8)
+
+summary(mod8)
+plot_bym(result = mod8, shapefile = shp)
+plot_ar1(result = mod8, time_mapping = data_full |> dplyr::select(nyeargroup, yeargroup) |> distinct())
+plot_lp(data = data_full, result = mod8, var_name = "logit_ratio_ipd_pcv7", label = "Proportion non-19F PCV7 sts")
+```
+
 ## Compare WAIC/DICs
 
 ```{r}
-mods <- list(base_mod = base_mod, mod2 = mod2, mod3 = mod3, mod4 = mod4, mod5 = mod5, mod6 = mod6, mod7 = mod7)
+mods <- list(base_mod = base_mod, mod2 = mod2, mod3 = mod3, mod4 = mod4, mod5 = mod5, mod6 = mod6, mod7 = mod7, mod8 = mod8)
 
 mod_comp <- data.frame(model = names(mods),
-                       formula = c(base_f, f2, f3, f4, f5, f6, f7),
+                       formula = c(base_f, f2, f3, f4, f5, f6, f7, f8),
                        waic = sapply(mods, function(res) round(res$waic$waic, 2)),
                        dic = sapply(mods, function(res) round(res$dic$dic, 2))) |> 
   mutate(waic_delta = waic - waic[1],
          dic_delta = dic - dic[1])
+```
+
+## Only with >= 65 years old
+
+```{r}
+data_full65 <- ipd_raw |> 
+  filter(agey >= 65) |> 
+  mutate(date = as.Date(DateOfIsolation, format = "%m/%d/%Y"),
+         plz_pre = str_pad(PLZpatient, side = "left", pad = "0", width = 3),
+         plz = substr(plz_pre, 1, 2),
+         year = year(date)) |> 
+  filter(!is.na(PLZpatient) & date > as.Date("2009-01-01") & !is.na(date) & !(plz %in% c("05", "11"))) |> 
+  arrange(year) |> 
+  group_by(year) |> 
+  mutate(nyear = cur_group_id()) |> 
+  ungroup() |> 
+  mutate(yeargroup = factor(cut(nyear, 3, labels = FALSE), levels = c(1:3), labels = c("2008-2012", "2013-2017", "2018-2022")),
+         nyeargroup = cut(nyear, 3, labels = FALSE)) |> 
+  group_by(plz, Serotype, yeargroup, nyeargroup) |> 
+  summarise(ipd_st = n()) |> 
+  group_by(plz, yeargroup, nyeargroup) |> 
+  mutate(ipd = sum(ipd_st),
+         ipd_pcv7 = sum(ipd_st[Serotype %in% pcv7_no19f], na.rm = TRUE)) |> 
+  ungroup() |> 
+  filter(Serotype %in% pcv7_st | Serotype == "19A") |> 
+  pivot_wider(names_from = Serotype, names_prefix = "ipd_", values_from = ipd_st) |> 
+  mutate(across(starts_with("ipd_"), ~ if_else(is.na(.x), 0, .x)), 
+         across(starts_with("ipd_"), ~ .x / ipd, .names = "ratio_{.col}"),
+         across(starts_with("ratio_ipd_"), ~ log((.x + 0.001) / (1 - .x + 0.001)), .names = "logit_{.col}")) |> 
+  left_join(vax_cov_agg, by = c("plz", "nyeargroup")) |> 
+  group_by(yeargroup) |> 
+  mutate(meancov = mean(vacc_rate, na.rm = TRUE)) |> 
+  ungroup() |> 
+  mutate(vacc_rate_d = vacc_rate - meancov,
+         vacc_cat_d = inla.group(vacc_rate_d, n = 10, method = "quantile")) |> 
+  left_join(dpt, by = c("plz", "nyeargroup"))
+
+# add geometries
+data_full65_sf <- shp |> 
+  mutate(idarea = row_number()) |> 
+  right_join(data_full, by = "plz") |> 
+  mutate(plz = factor(plz))
+```
+
+### Baseline
+
+```{r}
+base_f <- "cases_19F ~ 1 + f(idarea, model = 'bym2', graph = adj_mat) + f(t, model = 'ar1')"
+
+base_mod65 <- runmod(data = data_full65_sf, formula = base_f)
+
+summary(base_mod65)
+plot_bym(result = base_mod65, shapefile = shp)
+plot_ar1(result = base_mod65, time_mapping = data_full65 |> dplyr::select(nyeargroup, yeargroup) |> distinct())
+```
+
+### Vaccine coverage (linear)
+
+```{r}
+f2 <- "cases_19F ~ 1 + f(idarea, model = 'bym2', graph = adj_mat) + f(t, model = 'ar1') + vacc_rate"
+
+mod2_65 <- runmod(data = data_full65_sf, formula = f2)
+
+summary(mod2_65)
+plot_bym(result = mod2_65, shapefile = shp)
+plot_ar1(result = mod2_65, time_mapping = data_full65 |> dplyr::select(nyeargroup, yeargroup) |> distinct())
+plot_lp(data = data_full65, result = mod2_65, var_name = "vacc_rate", label = "PCV coverage")
+```
+
+### Delta vaccine coverage (linear)
+
+```{r}
+f4 <- "cases_19F ~ 1 + f(idarea, model = 'bym2', graph = adj_mat) + f(t, model = 'ar1') + vacc_rate_d"
+
+mod4_65 <- runmod(data = data_full65_sf, formula = f4)
+
+summary(mod4_65)
+plot_bym(result = mod4_65, shapefile = shp)
+plot_ar1(result = mod4_65, time_mapping = data_full65 |> dplyr::select(nyeargroup, yeargroup) |> distinct())
+plot_lp(data = data_full65, result = mod4_65, var_name = "vacc_rate_d", label = "Delta PCV coverage")
+```
+
+### DPT vaccine coverage (linear)
+
+```{r}
+f5 <- "cases_19F ~ 1 + f(idarea, model = 'bym2', graph = adj_mat) + f(t, model = 'ar1') + dpt_vacc_rate"
+
+mod5_65 <- runmod(data = data_full65_sf, formula = f5)
+
+summary(mod5_65)
+plot_bym(result = mod5_65, shapefile = shp)
+plot_ar1(result = mod5_65, time_mapping = data_full65 |> dplyr::select(nyeargroup, yeargroup) |> distinct())
+plot_lp(data = data_full65, result = mod5_65, var_name = "dpt_vacc_rate", label = "DPT coverage")
+```
+
+### 19A proportion (linear)
+
+```{r}
+f6 <- "cases_19F ~ 1 + f(idarea, model = 'bym2', graph = adj_mat) + f(t, model = 'ar1') + ratio_ipd_19A"
+
+mod6_65 <- runmod(data = data_full65_sf, formula = f6)
+
+summary(mod6_65)
+plot_bym(result = mod6_65, shapefile = shp)
+plot_ar1(result = mod6_65, time_mapping = data_full65 |> dplyr::select(nyeargroup, yeargroup) |> distinct())
+plot_lp(data = data_full65, result = mod6_65, var_name = "ratio_ipd_19A", label = "Proportion 19A")
+```
+
+```{r}
+f7 <- "cases_19F ~ 1 + f(idarea, model = 'bym2', graph = adj_mat) + f(t, model = 'ar1') + logit_ratio_ipd_19A"
+
+mod7_65 <- runmod(data = data_full65_sf, formula = f7)
+
+summary(mod7_65)
+plot_bym(result = mod7_65, shapefile = shp)
+plot_ar1(result = mod7_65, time_mapping = data_full65 |> dplyr::select(nyeargroup, yeargroup) |> distinct())
+plot_lp(data = data_full65, result = mod7_65, var_name = "logit_ratio_ipd_19A", label = "logit(Proportion 19A)")
+```
+
+### Other PCV7 serotypes
+
+```{r}
+f8 <- "cases_19F ~ 1 + f(idarea, model = 'bym2', graph = adj_mat) + f(t, model = 'ar1') + logit_ratio_ipd_pcv7"
+
+mod8_65 <- runmod(data = data_full65_sf, formula = f8)
+
+summary(mod8_65)
+plot_bym(result = mod8_65, shapefile = shp)
+plot_ar1(result = mod8_65, time_mapping = data_full65 |> dplyr::select(nyeargroup, yeargroup) |> distinct())
+plot_lp(data = data_full65, result = mod8_65, var_name = "logit_ratio_ipd_pcv7", label = "Proportion non-19F PCV7 sts")
 ```
