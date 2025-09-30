@@ -51,13 +51,13 @@ eur_raw <- read_csv("data/ecdc_processed.csv", col_select = -1)
 
 eur <- eur_raw |> 
   group_by(country, year, st) |> 
-  summarise(N_IPD = sum(total_cases, na.rm = TRUE))|> 
+  summarise(N_IPD_st = sum(N_cases, na.rm = TRUE))|> 
   group_by(country, year) |> 
-  mutate(IPD_total = sum(N_IPD)) |> 
+  mutate(IPD_total = sum(N_IPD_st)) |> 
   ungroup() |> 
   filter(st == "19F") |> 
   dplyr::select(-st) |> 
-  rename(IPD_19F = N_IPD) |> 
+  rename(IPD_19F = N_IPD_st) |> 
   mutate(prop_19F = IPD_19F/IPD_total)
 
 ger_ipd_raw <- read_csv("data/DE_IPD_deidentified.csv")
@@ -225,4 +225,8 @@ summary(lm(log(ratio_cases) ~ vax_type + time_secondvax + mean_cov + schedule, d
 # Ratio of proportions
 # None significant
 summary(lm(log(ratio_prop) ~ vax_type + time_secondvax + mean_cov + schedule, data = data_19F))
+
+
+#just look at proportion 19F in 2019
+summary(lm(log(prop_19F_2019) ~ vax_type + time_secondvax + mean_cov + schedule, data = data_19F))
 ```
