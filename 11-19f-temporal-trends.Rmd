@@ -79,8 +79,9 @@ ger <- ger_ipd_raw |>
 
 db_19F <- us |> 
   rbind(aus) |> 
-  rbind(eur) |> 
-  rbind(ger) 
+  rbind(eur) 
+#|> 
+ # rbind(ger) 
 
 db_19F_wide <- db_19F |> 
   filter(year >= 2010 & year < 2020) |> 
@@ -120,7 +121,8 @@ reactable(data_19F |>
 
 ```{r, fig.width = 12, fig.height = 6, message = FALSE}
 vax_years <- read_csv("data/vax-intro-years.csv") |> 
-  mutate(label = factor(label, levels = c("PCV7", "PCV10", "PCV13")))
+  mutate(label = factor(label, levels = c("PCV7", "PCV10", "PCV13"))) %>%
+  filter(country!='Germany')
 
 db_19F |> 
   filter(year >= 2010) |> 
@@ -155,6 +157,7 @@ db_19F |>
 
 db_19F |> 
   #filter(year < 2020) |> 
+  mutate(country=factor(country)) |>
   ggplot(aes(x = year, y = prop_19F)) +
   geom_vline(data = vax_years, aes(xintercept = year, color = label), lty = 2) +
   scale_color_manual(values = c("PCV7" = "black", "PCV10" = "blue", "PCV13" = "red"), name = "") +
@@ -229,4 +232,9 @@ summary(lm(log(ratio_prop) ~ vax_type + time_secondvax + mean_cov + schedule, da
 
 #just look at proportion 19F in 2019
 summary(lm(log(prop_19F_2019) ~ vax_type + time_secondvax + mean_cov + schedule, data = data_19F))
+
+summary(lm(log(prop_19F_2019) ~ time_secondvax, data = data_19F))
+
+#exclue US and Aus and still holds
+summary(lm(log(prop_19F_2019) ~ time_secondvax, data = data_19F[!(data_19F$country %in% c('United States', 'Australia') ),]))
 ```
