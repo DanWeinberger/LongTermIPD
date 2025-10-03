@@ -122,7 +122,7 @@ reactable(data_19F |>
 ```{r, fig.width = 12, fig.height = 6, message = FALSE}
 vax_years <- read_csv("data/vax-intro-years.csv") |> 
   mutate(label = factor(label, levels = c("PCV7", "PCV10", "PCV13"))) %>%
-  filter(country!='Germany')
+  filter(country!='Germany' & country != 'United States')
 
 db_19F |> 
   filter(year >= 2010) |> 
@@ -157,6 +157,7 @@ db_19F |>
 
 db_19F |> 
   #filter(year < 2020) |> 
+  filter(country!='United States') |>
   mutate(country=factor(country)) |>
   ggplot(aes(x = year, y = prop_19F)) +
   geom_vline(data = vax_years, aes(xintercept = year, color = label), lty = 2) +
